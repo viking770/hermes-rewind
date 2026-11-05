@@ -26,8 +26,18 @@ READ_ONLY_COMMANDS = frozenset(
 READ_ONLY_GIT = frozenset(
     {"blame", "describe", "diff", "grep", "log", "ls-files", "rev-parse", "show", "status"}
 )
-_FIND_WRITES = frozenset({"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls"})
+_FIND_WRITES = frozenset(
+    {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"}
+)
 _WRAPPERS = frozenset({"time", "command", "builtin", "nohup"})
+# env options that take a separate argument.
+_ENV_ARG_OPTIONS = frozenset({"-u", "--unset", "-C", "--chdir"})
+# Commands whose second positional argument is an output file (`uniq in out`).
+_OUTPUT_FILE_ARG = frozenset({"uniq", "xxd"})
+# sed commands that write files (w, W) or run shell commands (e), either on
+# their own (`3w out`, `/x/e`) or as an s/// flag (`s/a/b/w out`, `s/a/b/ge`).
+_SED_COMMAND = re.compile(r"(?:^|[;{}\n/0-9$!])\s*[wWe](?:\s|;|$)")
+_SED_S_FLAG = re.compile(r"s(.)(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[gpiImM0-9]*[we]")
 
 # ">", ">>", "2>", "&>" followed by a target. Targets "&N" (fd dup) and
 # /dev/null do not touch the filesystem.
@@ -70,21 +80,63 @@ def _segment_mutates(segment: str) -> bool:
         words = shlex.split(segment)
     except ValueError:
         words = segment.split()
+    return _words_mutate(words)
+
+
+def _words_mutate(words: list) -> bool:
     while words and (_ASSIGNMENT.match(words[0]) or words[0] in _WRAPPERS):
         words = words[1:]
     if not words:
         return False
     program = words[0].rsplit("/", 1)[-1]
     args = words[1:]
+    if program == "env":
+        return _env_mutates(args)
     if program == "git":
         sub = next((a for a in args if not a.startswith("-")), "")
         return sub not in READ_ONLY_GIT
     if program not in READ_ONLY_COMMANDS:
         return True
-    if program == "sed" and any(a == "-i" or a.startswith(("-i", "--in-place")) for a in args):
-        return True
+    if program == "sed":
+        return _sed_mutates(args)
+    if program == "awk":
+        # awk can run commands with system(), and gawk can edit files in place.
+        return any("system" in a or a in ("-i", "--include") or a.startswith("-i") for a in args)
     if program == "find" and any(a in _FIND_WRITES for a in args):
         return True
     if program == "sort" and any(a == "-o" or a.startswith("--output") for a in args):
         return True
+    if program == "tree" and any(a == "-o" for a in args):
+        return True
+    if program in _OUTPUT_FILE_ARG and len([a for a in args if not a.startswith("-")]) >= 2:
+        return True
+    return False
+
+
+def _env_mutates(args: list) -> bool:
+    """`env` alone only prints; `env [options] [NAME=value...] cmd` runs cmd."""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in _ENV_ARG_OPTIONS:
+            i += 2
+        elif arg in ("-S", "--split-string") or arg.startswith(("-S", "--split-string")):
+            return True  # the command is hidden inside a string; don't try to parse it
+        elif arg.startswith("-") or _ASSIGNMENT.match(arg):
+            i += 1
+        else:
+            return _words_mutate(args[i:])
+    return False
+
+
+def _sed_mutates(args: list) -> bool:
+    for i, arg in enumerate(args):
+        if arg == "-i" or arg.startswith(("-i", "--in-place")):
+            return True
+        if arg in ("-f", "--file") or arg.startswith("--file="):
+            return True  # the script is in a file we can't inspect
+        if arg.startswith("-") and arg not in ("-e", "--expression"):
+            continue
+        if _SED_COMMAND.search(arg) or _SED_S_FLAG.search(arg):
+            return True
     return False

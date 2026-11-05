@@ -1,5 +1,6 @@
 import json
 import subprocess
+import time
 import unittest
 
 from rewind import RewindProvider, registry, tools
@@ -15,7 +16,10 @@ class FakeDocker:
         self.exec_code = 0
         self.exec_cwd = "/workspace"
         self.fail = set()
+        self.fail_images = set()  # `docker run` fails for these images
         self.timeout_exec = False
+        self.diff_output = "C /workspace\nA /workspace/new.txt\n"
+        self.image_info = {}  # image -> "size layers" for `docker image inspect`
 
     def __call__(self, argv, timeout=None):
         assert argv[0] == "docker"
@@ -23,6 +27,8 @@ class FakeDocker:
         verb = argv[1]
         if verb in self.fail:
             return 1, f"{verb} exploded"
+        if verb == "run" and self.fail_images.intersection(argv):
+            return 1, "image is broken"
         if verb == "exec":
             if argv[-1] == "command -v bash":
                 return 0, "/bin/bash\n"
@@ -30,7 +36,10 @@ class FakeDocker:
                 raise subprocess.TimeoutExpired(argv, timeout, output=b"partial")
             return self.exec_code, f"{self.exec_output}\n{_CWD_MARKER}{self.exec_cwd}\n"
         if verb == "diff":
-            return 0, "C /workspace\nA /workspace/new.txt\n"
+            return 0, self.diff_output
+        if verb == "image" and argv[2] == "inspect":
+            info = self.image_info.get(argv[-1])
+            return (0, info + "\n") if info else (1, "No such image")
         return 0, ""
 
     def verbs(self):
@@ -38,6 +47,9 @@ class FakeDocker:
 
 
 def make_env(fake, **kw):
+    # Snapshot before each command, so call order is deterministic. Background
+    # snapshots have their own tests below.
+    kw.setdefault("background", False)
     return RewindEnvironment(task_id="Demo Task", runner=fake, **kw)
 
 
@@ -98,6 +110,34 @@ class EnvironmentTests(unittest.TestCase):
         result = env.execute("ls")
         self.assertEqual(result["exit_code"], 1)
         self.assertIn("could not start", result["output"])
+        # The half-created container is removed so a retry can reuse the name.
+        self.assertEqual(self.fake.calls[-1], ["docker", "rm", "-f", env.container])
+        self.fake.fail.clear()
+        self.assertEqual(env.execute("ls")["exit_code"], 0)
+
+    def test_failed_restore_falls_back_to_safety_snapshot(self):
+        env = make_env(self.fake)
+        env.execute("rm a")  # s1
+        self.fake.fail_images.add(env.snapshots[0].image)
+        with self.assertRaises(RewindError) as ctx:
+            env.restore("s1")
+        self.assertIn("s2", str(ctx.exception))
+        run_calls = [c for c in self.fake.calls if c[1] == "run"]
+        self.assertIn(f"{env.repository}:s2", run_calls[-1])
+        self.assertTrue(env._started)
+
+    def test_failed_restore_and_fallback_retries_from_safety_not_base(self):
+        env = make_env(self.fake)
+        env.execute("rm a")  # s1
+        self.fake.fail_images.update({env.snapshots[0].image, f"{env.repository}:s2"})
+        with self.assertRaises(RewindError):
+            env.restore("s1")
+        self.assertFalse(env._started)
+        self.fake.fail_images.clear()
+        env.execute("ls")
+        run_calls = [c for c in self.fake.calls if c[1] == "run"]
+        self.assertIn(f"{env.repository}:s2", run_calls[-1])
+        self.assertNotIn(env.base_image, run_calls[-1])
 
     def test_restore_recreates_container_from_snapshot(self):
         env = make_env(self.fake)
@@ -146,6 +186,63 @@ class EnvironmentTests(unittest.TestCase):
         self.assertIn(f"{env.repository}:s1", rmi)
         self.assertIsNone(registry.get())
 
+    def runs(self):
+        return [c for c in self.fake.calls if c[1] == "run"]
+
+    def test_big_snapshot_compacts_container(self):
+        env = make_env(self.fake, compact_mb=1)
+        self.fake.image_info = {
+            env.base_image: "1000 4",
+            f"{env.repository}:s1": f"{3 * 1024 * 1024} 5",
+            f"{env.repository}:s2": f"{3 * 1024 * 1024 + 10} 6",
+        }
+        result = env.execute("pip install big")
+        self.assertEqual(result["exit_code"], 0)
+        self.assertIn(f"{env.repository}:s1", self.runs()[-1])
+        self.assertEqual(self.fake.verbs()[-1], "exec")  # the command still runs
+        # The next snapshot is small relative to s1, so no further restart.
+        env.execute("rm x")
+        self.assertEqual(len(self.runs()), 2)
+
+    def test_small_snapshot_does_not_compact(self):
+        env = make_env(self.fake, compact_mb=1)
+        self.fake.image_info = {env.base_image: "1000 4", f"{env.repository}:s1": "5000 5"}
+        env.execute("rm x")
+        self.assertEqual(len(self.runs()), 1)
+
+    def test_compaction_stops_near_layer_limit(self):
+        env = make_env(self.fake, compact_mb=1)
+        self.fake.image_info = {env.base_image: "1000 4", f"{env.repository}:s1": f"{10 ** 9} 100"}
+        env.execute("rm x")
+        self.assertEqual(len(self.runs()), 1)
+
+    def test_compaction_off(self):
+        env = make_env(self.fake, compact_mb=0)
+        env.execute("rm x")
+        self.assertNotIn("image", self.fake.verbs())
+
+    def test_changes_survive_compaction_and_reset_on_restore(self):
+        env = make_env(self.fake, compact_mb=1)
+        self.fake.image_info = {env.base_image: "1000 4", f"{env.repository}:s1": f"{10 ** 9} 5"}
+        self.fake.diff_output = "A /workspace/a.txt\nA /workspace/gone.txt\nD /workspace/old.txt\n"
+        env.execute("pip install big")  # compacts, carrying these changes
+        self.fake.diff_output = "D /workspace/gone.txt\nA /workspace/old.txt\nC /workspace/a.txt\n"
+        self.assertEqual(env.changes(), ["A /workspace/a.txt", "C /workspace/old.txt"])
+        env.restore("s1")
+        self.assertEqual(env.changes(), sorted(self.fake.diff_output.splitlines(), key=lambda l: l[2:]))
+
+    def test_failed_compaction_restart_is_retried_from_snapshot(self):
+        env = make_env(self.fake, compact_mb=1)
+        s1 = f"{env.repository}:s1"
+        self.fake.image_info = {env.base_image: "1000 4", s1: f"{10 ** 9} 5"}
+        self.fake.fail_images.add(s1)
+        result = env.execute("pip install big")
+        self.assertEqual(result["exit_code"], 1)
+        self.assertIn("could not start", result["output"])
+        self.fake.fail_images.clear()
+        self.assertEqual(env.execute("ls")["exit_code"], 0)
+        self.assertIn(s1, self.runs()[-1])
+
     def test_network_off(self):
         env = make_env(self.fake, network=False)
         env.execute("ls")
@@ -160,6 +257,116 @@ class EnvironmentTests(unittest.TestCase):
     def test_bad_mode(self):
         with self.assertRaises(ValueError):
             make_env(self.fake, snapshot_mode="sometimes")
+
+
+class BackgroundSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        registry.clear()
+        self.fake = FakeDocker()
+        self.env = make_env(self.fake, background=True)
+
+    def calls_during(self, fn):
+        """Run fn, wait for any background commit, return the docker verbs fn
+        caused, leaving out compaction's `image inspect` size checks."""
+        self.env._finish_background()
+        start = len(self.fake.calls)
+        fn()
+        before_join = [v for v in self.fake.verbs()[start:] if v != "image"]
+        self.env._finish_background()
+        return before_join, [v for v in self.fake.verbs()[start:] if v != "image"]
+
+    def test_changing_command_claims_ready_snapshot_instead_of_waiting(self):
+        env = self.env
+        env.execute("ls")  # leaves a snapshot of the current state committing in the background
+        _, verbs = self.calls_during(lambda: env.execute("rm -rf build"))
+        self.assertEqual(verbs[0], "exec")  # ran straight away, no commit first
+        self.assertEqual(verbs[1:], ["commit"])  # next state committed after it
+        self.assertEqual([(s.id, s.command) for s in env.snapshots], [("s1", "rm -rf build")])
+        self.assertIsNotNone(env._pending)
+        self.assertEqual(env._pending.id, "s2")
+
+    def test_read_only_commands_keep_the_pending_snapshot(self):
+        env = self.env
+        env.execute("ls")
+        _, verbs = self.calls_during(lambda: env.execute("cat README.md"))
+        self.assertEqual(verbs, ["exec"])
+        env.execute("rm x")
+        self.assertEqual(env.snapshots[-1].id, "s1")
+
+    def test_first_change_without_a_ready_snapshot_commits_first(self):
+        env = self.env
+        _, verbs = self.calls_during(lambda: env.execute("rm x"))
+        self.assertLess(verbs.index("commit"), verbs.index("exec", 2))
+        self.assertEqual(env.snapshots[0].command, "rm x")
+
+    def test_failed_background_commit_falls_back_to_committing_first(self):
+        env = self.env
+        self.fake.fail.add("commit")
+        env.execute("ls")
+        env._finish_background()
+        self.assertIsNone(env._pending)
+        self.fake.fail.clear()
+        start = len(self.fake.calls)
+        env.execute("rm x")
+        self.assertEqual(self.fake.verbs()[start], "commit")
+        self.assertEqual(env.snapshots[0].command, "rm x")
+
+    def test_next_command_waits_for_a_slow_commit(self):
+        env = self.env
+        order = []
+        real = self.fake.__call__
+
+        def slow(argv, timeout=None):
+            if argv[1] == "commit":
+                time.sleep(0.3)
+                order.append("commit done")
+            elif argv[1] == "exec" and "rm y" in argv[-1]:
+                order.append("rm y runs")
+            return real(argv, timeout)
+
+        env._run = slow
+        started = time.time()
+        env.execute("rm x")  # commits first (nothing ready), then starts a background commit
+        returned = time.time() - started
+        self.assertLess(returned, 0.55)  # one commit, not two
+        env.execute("rm y")
+        self.assertEqual(order[-2:], ["commit done", "rm y runs"])
+
+    def test_restore_uses_ready_snapshot_as_safety_and_prepares_another(self):
+        env = self.env
+        env.execute("rm a")   # s1 (committed first), s2 pending
+        env._finish_background()
+        _, verbs = self.calls_during(lambda: env.restore("s1"))
+        target, safety = env.find("s1"), env.snapshots[-1]
+        self.assertEqual(safety.id, "s2")
+        self.assertEqual(safety.label, "before restoring s1")
+        self.assertNotIn("commit", verbs[:verbs.index("run")])  # safety was already committed
+        self.assertEqual(verbs[-1], "commit")  # prepared for the next change
+        self.assertEqual(env._pending.id, "s3")
+        self.assertIn(target.image, [c for c in self.fake.calls if c[1] == "run"][-1])
+
+    def test_manual_snapshot_claims_pending_and_prepares_another(self):
+        env = self.env
+        env.execute("ls")
+        env._finish_background()
+        snap = env.snapshot("checkpoint")
+        self.assertEqual((snap.id, snap.label, snap.auto), ("s1", "checkpoint", False))
+        env._finish_background()
+        self.assertEqual(env._pending.id, "s2")
+
+    def test_cleanup_removes_unclaimed_pending_image(self):
+        env = self.env
+        env.execute("ls")
+        env.cleanup()
+        rmi = [c for c in self.fake.calls if c[1] == "rmi"][-1]
+        self.assertIn(f"{env.repository}:s1", rmi)
+        self.assertIsNone(env._pending)
+
+    def test_off_mode_never_commits(self):
+        env = make_env(self.fake, background=True, snapshot_mode="off")
+        env.execute("rm x")
+        env._finish_background()
+        self.assertNotIn("commit", self.fake.verbs())
 
 
 class ToolTests(unittest.TestCase):

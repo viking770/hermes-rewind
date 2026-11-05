@@ -9,6 +9,9 @@ Optional settings (environment variables):
     REWIND_SNAPSHOT_MODE  mutating | always | off (default mutating)
     REWIND_MAX_SNAPSHOTS  automatic snapshots to keep (default 25)
     REWIND_NETWORK        set to 0 to run the sandbox without network access
+    REWIND_COMPACT_MB     compact snapshots once changes pass this size (default 256, 0 = never)
+    REWIND_DOCKER_API     set to 0 to always use the docker CLI instead of the Engine API
+    REWIND_BACKGROUND     set to 0 to snapshot right before each command instead of in the background
 """
 from __future__ import annotations
 
@@ -21,7 +24,13 @@ except ImportError:  # imported outside Hermes, e.g. by the unit tests
     from ._compat import TerminalEnvironmentProvider
 
 from . import tools
-from .environment import DEFAULT_CWD, DEFAULT_IMAGE, DEFAULT_MAX_SNAPSHOTS, RewindEnvironment
+from .environment import (
+    DEFAULT_COMPACT_MB,
+    DEFAULT_CWD,
+    DEFAULT_IMAGE,
+    DEFAULT_MAX_SNAPSHOTS,
+    RewindEnvironment,
+)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -74,6 +83,9 @@ class RewindProvider(TerminalEnvironmentProvider):
             snapshot_mode=os.environ.get("REWIND_SNAPSHOT_MODE", "mutating"),
             max_snapshots=_env_int("REWIND_MAX_SNAPSHOTS", DEFAULT_MAX_SNAPSHOTS),
             network=os.environ.get("REWIND_NETWORK", "1") != "0",
+            compact_mb=_env_int("REWIND_COMPACT_MB", DEFAULT_COMPACT_MB),
+            docker_api=os.environ.get("REWIND_DOCKER_API", "1") != "0",
+            background=os.environ.get("REWIND_BACKGROUND", "1") != "0",
         )
 
 

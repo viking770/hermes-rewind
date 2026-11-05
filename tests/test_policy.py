@@ -17,6 +17,13 @@ class PolicyTests(unittest.TestCase):
             "ls > /dev/null",
             "FOO=1 env",
             "echo hello 2>&1",
+            "env -u HOME FOO=1",
+            "env ls -la",
+            "awk -F, '{print $1}' data.csv",
+            "sed 's/hello/world/g' app.py",
+            "sed -e 's/a/b/' -e '1,5p' styles.css",
+            "uniq data.txt",
+            "xxd image.png",
             "",
         ]:
             with self.subTest(cmd=cmd):
@@ -39,6 +46,21 @@ class PolicyTests(unittest.TestCase):
             "ls $(rm -rf /)",
             "sort -o out.txt in.txt",
             "unknowncommand",
+            "env rm -rf src",
+            "env -i PATH=/bin rm x",
+            "env -u HOME python3 x.py",
+            "env -S 'rm -rf src'",
+            "awk 'BEGIN{system(\"rm -rf src\")}'",
+            "awk -i inplace '{print}' app.py",
+            "sed 's/a/b/w out.txt' app.py",
+            "sed 's/a/b/gw out.txt' app.py",
+            "sed -n '3w out.txt' app.py",
+            "sed '/foo/e' app.py",
+            "sed -f script.sed app.py",
+            "find . -fprint0 list.txt",
+            "uniq in.txt out.txt",
+            "xxd -r dump.hex out.bin",
+            "tree -o tree.txt",
         ]:
             with self.subTest(cmd=cmd):
                 self.assertTrue(is_mutating(cmd))
