@@ -466,21 +466,11 @@ class ToolTests(unittest.TestCase):
         self.assertIn("won't guess", result["error"])
         self.assertTrue(self.call("rewind_list", task_id="other")["ok"])
 
-    def test_tools_use_the_sandbox_hermes_maps_the_task_to(self):
-        # Inside Hermes, tool task_ids and sandbox keys differ (one shared
-        # "default" sandbox by default); Rewind asks Hermes which one it is.
-        import sys
-        import types
-        shared = RewindEnvironment(task_id="default", runner=self.fake, background=False)
-        RewindEnvironment(task_id="unrelated", runner=self.fake, background=False)
-        fake_mod = types.ModuleType("tools.terminal_tool_lifecycle")
-        fake_mod.get_active_env = lambda task_id: shared if task_id == "session-123" else None
-        sys.modules["tools.terminal_tool_lifecycle"] = fake_mod
-        try:
-            result = self.call("rewind_list", task_id="session-123")
-        finally:
-            del sys.modules["tools.terminal_tool_lifecycle"]
-        self.assertTrue(result["ok"], result)
+    def test_shared_sandbox_serves_any_task_id(self):
+        # Hermes's default: one sandbox created as "default", tool calls with
+        # each session's own task_id.
+        RewindEnvironment(task_id="default", runner=self.fake, background=False)
+        self.assertTrue(self.call("rewind_list", task_id="session-123")["ok"])
 
     def test_tools_without_sandbox_return_error(self):
         result = self.call("rewind_list")

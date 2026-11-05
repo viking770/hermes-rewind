@@ -6,7 +6,7 @@ import shutil
 import subprocess
 
 from . import registry
-from .environment import RewindEnvironment, RewindError
+from .environment import RewindError
 
 TOOLSET = "rewind"
 
@@ -66,21 +66,13 @@ def _err(message: str) -> str:
     return json.dumps({"ok": False, "error": message})
 
 
-def _hermes_env(task_id):
-    """The sandbox Hermes's terminal tool uses for this task_id. Hermes keys
-    sandboxes by its own scheme (one shared "default" sandbox unless
-    container_persistent is false), so ask it rather than guess."""
-    try:
-        from tools.terminal_tool_lifecycle import get_active_env
-        env = get_active_env(task_id or "default")
-    except Exception:  # not running inside Hermes, or its internals changed
-        return None
-    return env if isinstance(env, RewindEnvironment) else None
-
-
 def _env(kwargs):
+    """The sandbox for this tool call. Hermes creates a sandbox with the
+    session's task_id when sessions are isolated (container_persistent: false)
+    and shares one otherwise, so an exact match or the only sandbox covers
+    both; anything else is refused rather than guessed."""
     task_id = kwargs.get("task_id")
-    env = _hermes_env(task_id) or registry.get(task_id)
+    env = registry.get(task_id)
     if env is None:
         if registry.count() > 1:
             raise RewindError(
