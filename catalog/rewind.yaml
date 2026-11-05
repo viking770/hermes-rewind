@@ -1,0 +1,17 @@
+# Draft for the hackathon PR. Copy to plugin-catalog/rewind.yaml in
+# NousResearch/hermes-agent once the plugin repo is public.
+name: rewind
+title: Rewind
+repo: https://github.com/REPLACE_ME/hermes-rewind      # https only
+sha: REPLACE_WITH_FULL_40_CHAR_COMMIT_SHA
+subdir: rewind
+version: "0.1.0"
+description: Undo button for the agent's terminal. A Docker sandbox backend that snapshots before every file-changing command and can roll back.
+maintainer: REPLACE_ME
+tier: community
+category: tools
+requires_hermes: ">=0.22"          # keep in sync with rewind/plugin.yaml
+docs_url: https://github.com/REPLACE_ME/hermes-rewind#readme
+platforms: [macos, linux, windows]
+capabilities:
+  provides_tools: [rewind_list, rewind_snapshot, rewind_restore, rewind_changes]
