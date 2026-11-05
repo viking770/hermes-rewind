@@ -49,6 +49,51 @@ class DockerIntegrationTest(unittest.TestCase):
         exported = env.export("/workspace/app", Path(tempfile.mkdtemp()))
         self.assertEqual((exported / "data.txt").read_text().strip(), "important")
 
+    def test_hardened_and_firewalled(self):
+        """H1 and H2 on a real daemon: no host or LAN access, internet and
+        package installs still work, capabilities dropped, limits applied."""
+        env = self.env
+        probe = (
+            "python3 - <<'EOF'\n"
+            "import socket\n"
+            "def tcp(host, port):\n"
+            "    try:\n"
+            "        s = socket.create_connection((host, port), timeout=4); s.close(); return 'open'\n"
+            "    except OSError as e:\n"
+            "        return 'blocked:' + type(e).__name__\n"
+            "try:\n"
+            "    host_ip = socket.gethostbyname('host.docker.internal')\n"
+            "except OSError:\n"
+            "    host_ip = None\n"
+            "print('host', tcp(host_ip, 445) if host_ip else 'blocked:no-name')\n"
+            "print('metadata', tcp('169.254.169.254', 80))\n"
+            "print('lan', tcp('192.168.1.1', 80))\n"
+            "print('internet', tcp('example.com', 443))\n"
+            "EOF"
+        )
+        out = env.execute(probe)["output"]
+        lines = dict(line.split(" ", 1) for line in out.strip().splitlines() if " " in line)
+        self.assertTrue(lines.get("host", "").startswith("blocked"), out)
+        self.assertTrue(lines.get("metadata", "").startswith("blocked"), out)
+        self.assertTrue(lines.get("lan", "").startswith("blocked"), out)
+        self.assertEqual(lines.get("internet"), "open", out)
+
+        # The sandbox can't remove the rules: it has no NET_ADMIN (or any extra capability).
+        caps = env.execute("grep CapEff /proc/self/status")["output"].split()[-1]
+        self.assertEqual(int(caps, 16) & (1 << 12), 0, caps)  # CAP_NET_ADMIN
+        self.assertEqual(int(caps, 16) & (1 << 13), 0, caps)  # CAP_NET_RAW
+        r = env.execute("pip install --quiet --no-cache-dir six && python3 -c 'import six; print(six.__name__)'")
+        self.assertIn("six", r["output"], r["output"])
+        r = env.execute("apt-get update -qq >/dev/null && apt-get install -y -qq tree >/dev/null && tree --version")
+        self.assertIn("tree v", r["output"], r["output"])
+        self.assertEqual(env.execute("cat /sys/fs/cgroup/pids.max")["output"].strip(), "2048")
+
+        # The rules come back after a restore (a new container).
+        env.restore("last")
+        out = env.execute(probe)["output"]
+        self.assertIn("host blocked", out)
+        self.assertIn("internet open", out)
+
     def test_snapshots_survive_cleanup_and_resume(self):
         store = Store(Path(tempfile.mkdtemp()))
         image = os.environ.get("REWIND_IMAGE", "python:3.12-slim")

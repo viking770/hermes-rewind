@@ -14,6 +14,7 @@ import posixpath
 import re
 import shlex
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -37,6 +38,56 @@ _LIST_FILES = (
     "-printf '%P\\t%s\\t%T@\\n' 2>/dev/null | head -n 20000"
 )
 _SUMMARY_LIMIT = 20
+
+# ------------------------------------------------------------- hardening
+# The same baseline as Hermes's own Docker backend: drop every capability and
+# add back only what package managers need (file ownership, and setuid/setgid
+# so apt can drop to its _apt user), and forbid gaining privileges.
+_SECURITY_ARGS = (
+    "--cap-drop", "ALL",
+    "--cap-add", "CHOWN", "--cap-add", "DAC_OVERRIDE", "--cap-add", "FOWNER",
+    "--cap-add", "SETUID", "--cap-add", "SETGID",
+    "--security-opt", "no-new-privileges",
+)
+DEFAULT_PIDS_LIMIT = 2048  # Hermes's default; a fork bomb stops here
+DEFAULT_CPUS = 1.0  # Hermes's terminal.container_cpu default
+DEFAULT_MEMORY_MB = 5120  # Hermes's terminal.container_memory default
+_LIMIT_ERROR = re.compile(r"cgroup|NanoCPUs|pids|memory limit|Minimum memory|cpus", re.IGNORECASE)
+
+NETWORK_MODES = ("internet", "none", "full")
+# Destinations the sandbox may not reach in "internet" mode: this computer
+# (Docker Desktop's host.docker.internal is 192.168.65.254), the LAN, carrier
+# NAT, link-local and cloud metadata (169.254.169.254), multicast, reserved.
+_BLOCKED_V4 = ("0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+               "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15",
+               "224.0.0.0/4", "240.0.0.0/4")
+_BLOCKED_V6 = ("::1/128", "::ffff:0:0/96", "fc00::/7", "fe80::/10", "ff00::/8")
+GUARD_IMAGE = "hermes-rewind-netguard:1"
+_GUARD_OK = "REWIND_GUARD_OK"
+_GUARD_DOCKERFILE = (
+    f"FROM {DEFAULT_IMAGE}\n"
+    "RUN apt-get update && apt-get install -y --no-install-recommends iptables "
+    "&& rm -rf /var/lib/apt/lists/*\n"
+)
+
+
+def _guard_script(nameservers: Sequence[str]) -> str:
+    """Shell for the guard helper: allow loopback and DNS to the sandbox's own
+    resolvers, reject every blocked range, then confirm the rules are in."""
+    v4 = [ns for ns in nameservers if ":" not in ns]
+    v6 = [ns for ns in nameservers if ":" in ns]
+    lines = ["set -e", "iptables -A OUTPUT -o lo -j ACCEPT"]
+    for ns in v4:
+        lines += [f"iptables -A OUTPUT -d {ns} -p {p} --dport 53 -j ACCEPT" for p in ("udp", "tcp")]
+    lines += [f"iptables -A OUTPUT -d {net} -j REJECT" for net in _BLOCKED_V4]
+    # IPv6 is often disabled in containers; block it when it's there.
+    v6_rules = ["ip6tables -A OUTPUT -o lo -j ACCEPT"]
+    for ns in v6:
+        v6_rules += [f"ip6tables -A OUTPUT -d {ns} -p {p} --dport 53 -j ACCEPT" for p in ("udp", "tcp")]
+    v6_rules += [f"ip6tables -A OUTPUT -d {net} -j REJECT" for net in _BLOCKED_V6]
+    lines.append("if ip6tables -S OUTPUT >/dev/null 2>&1; then " + " && ".join(v6_rules) + "; fi")
+    lines.append(f"iptables -S OUTPUT | grep -q REJECT && echo {_GUARD_OK}")
+    return "\n".join(lines)
 # overlay2 refuses images deeper than ~125 layers. Each compaction adds one,
 # so stop compacting well before that and let snapshots grow instead.
 MAX_LAYERS = 100
@@ -124,7 +175,7 @@ class RewindEnvironment:
         image: str = DEFAULT_IMAGE,
         snapshot_mode: str = "mutating",
         max_snapshots: int = DEFAULT_MAX_SNAPSHOTS,
-        network: bool = True,
+        network="internet",
         compact_mb: int = DEFAULT_COMPACT_MB,
         docker_api: bool = True,
         background: bool = True,
@@ -133,6 +184,9 @@ class RewindEnvironment:
         keep_hours: float = 0,
         store: Optional[Store] = None,
         export_max_mb: int = DEFAULT_EXPORT_MAX_MB,
+        cpus: Optional[float] = DEFAULT_CPUS,
+        memory_mb: Optional[int] = DEFAULT_MEMORY_MB,
+        pids_limit: Optional[int] = DEFAULT_PIDS_LIMIT,
     ) -> None:
         if snapshot_mode not in policy.MODES:
             raise ValueError(f"snapshot_mode must be one of {policy.MODES}, got {snapshot_mode!r}")
@@ -142,7 +196,19 @@ class RewindEnvironment:
         self.base_image = image or DEFAULT_IMAGE
         self.snapshot_mode = snapshot_mode
         self.max_snapshots = max(1, int(max_snapshots))
-        self.network = network
+        # True/False are the pre-0.2.1 spelling: on = "internet" (now firewalled), off = "none".
+        mode = {True: "internet", False: "none"}.get(network, network)
+        if mode not in NETWORK_MODES:
+            raise ValueError(f"network must be one of {NETWORK_MODES}, got {network!r}")
+        self.network_mode = mode
+        self.network = mode != "none"
+        self._limits: List[str] = []
+        if pids_limit:
+            self._limits += ["--pids-limit", str(int(pids_limit))]
+        if cpus:
+            self._limits += ["--cpus", f"{float(cpus):g}"]
+        if memory_mb:
+            self._limits += ["--memory", f"{int(memory_mb)}m"]
         self.compact_bytes = max(0, int(compact_mb)) * 1024 * 1024
         self.background = background
         self.docker_bin = docker_bin
@@ -198,6 +264,33 @@ class RewindEnvironment:
         return code, out
 
     def _start_container(self, image: str) -> None:
+        if not image or image.startswith("-"):  # never let an image name become a docker option
+            raise RewindError(f"Refusing to start the sandbox from image {image!r}.")
+        mode = self.network_mode
+        try:
+            self._run_container(image, "none" if mode == "none" else "bridge")
+        except RewindError as exc:
+            if not self._limits or not _LIMIT_ERROR.search(str(exc)):
+                raise
+            # This Docker can't apply cgroup limits (e.g. an unprivileged LXC host).
+            self._limits = []
+            self._note += ("[rewind] warning: this Docker can't apply CPU/memory/process limits, "
+                           "so the sandbox runs without them.\n")
+            self._run_container(image, "none" if mode == "none" else "bridge")
+        self._image = image
+        if mode == "internet":
+            try:
+                self._guard_network()
+            except (RewindError, subprocess.TimeoutExpired, OSError) as exc:
+                # Fail closed: a sandbox that can reach this computer is worse than one with no network.
+                self._docker("rm", "-f", self.container, timeout=60, check=False)
+                self._run_container(image, "none")
+                self._note += (
+                    "[rewind] warning: couldn't firewall the sandbox's network, so it has no network "
+                    f"this time ({str(exc)[:200]}). Set REWIND_NETWORK=full to allow unrestricted access.\n"
+                )
+
+    def _run_container(self, image: str, network: str) -> None:
         argv = [
             "run", "-d",
             "--name", self.container,
@@ -207,8 +300,9 @@ class RewindEnvironment:
             # from a sandbox another live process is using (store.reap).
             "--label", f"{store_mod.PID_LABEL}={os.getpid()}",
             "--label", f"{store_mod.HOST_LABEL}={store_mod.hostname()}",
+            *_SECURITY_ARGS, *self._limits,
         ]
-        if not self.network:
+        if network == "none":
             argv += ["--network", "none"]
         keepalive = f"mkdir -p {shlex.quote(self.cwd)}; while :; do sleep 3600; done"
         argv += ["--entrypoint", "/bin/sh", image, "-c", keepalive]
@@ -220,7 +314,36 @@ class RewindEnvironment:
             # name, which would make every retry fail with a name conflict.
             self._docker("rm", "-f", self.container, timeout=60, check=False)
             raise
-        self._image = image
+
+    # --------------------------------------------------------- network guard
+    def _guard_network(self) -> None:
+        """Block the host, private networks and cloud metadata from inside the
+        sandbox's network namespace, leaving DNS and the internet reachable.
+
+        A short-lived helper container joins the sandbox's namespace with
+        NET_ADMIN and installs the rules. The sandbox itself runs with every
+        capability dropped, so nothing inside it can change them back.
+        """
+        self._ensure_guard_image()
+        _, resolv = self._docker("exec", self.container, "cat", "/etc/resolv.conf", timeout=30, check=False)
+        servers = [line.split()[1] for line in resolv.splitlines()
+                   if line.startswith("nameserver") and len(line.split()) > 1
+                   and re.fullmatch(r"[0-9a-fA-F:.]+", line.split()[1])]
+        code, out = self._docker(
+            "run", "--rm", "--network", f"container:{self.container}",
+            "--cap-drop", "ALL", "--cap-add", "NET_ADMIN", "--entrypoint", "sh", GUARD_IMAGE,
+            "-c", _guard_script(servers), timeout=120, check=False,
+        )
+        if code != 0 or _GUARD_OK not in out:
+            raise RewindError(f"network rules failed (exit {code}): {out.strip()[-300:]}")
+
+    def _ensure_guard_image(self) -> None:
+        if self._inspect_image_exists(GUARD_IMAGE):
+            return
+        # Built once per machine from the default base image, which Rewind pulls anyway.
+        with tempfile.TemporaryDirectory(prefix="rewind-guard-") as build_dir:
+            Path(build_dir, "Dockerfile").write_text(_GUARD_DOCKERFILE, encoding="utf-8")
+            self._docker("build", "--quiet", "-t", GUARD_IMAGE, build_dir, timeout=900)
 
     def _ensure_started(self) -> None:
         if self._started:

@@ -8,7 +8,9 @@ Optional settings (environment variables):
     REWIND_IMAGE          base image (default python:3.12-slim)
     REWIND_SNAPSHOT_MODE  mutating | always | off (default mutating)
     REWIND_MAX_SNAPSHOTS  automatic snapshots to keep (default 25)
-    REWIND_NETWORK        set to 0 to run the sandbox without network access
+    REWIND_NETWORK        internet (default; this computer and the LAN are blocked), none, or full
+    REWIND_CPUS / REWIND_MEMORY_MB / REWIND_PIDS_LIMIT  sandbox limits (default: Hermes's
+                          terminal.container_cpu and container_memory, 2048 processes; 0 = no limit)
     REWIND_COMPACT_MB     compact snapshots once changes pass this size (default 256, 0 = never)
     REWIND_DOCKER_API     set to 0 to always use the docker CLI instead of the Engine API
     REWIND_BACKGROUND     set to 0 to snapshot right before each command instead of in the background
@@ -101,7 +103,9 @@ class RewindProvider(TerminalEnvironmentProvider):
             image=image or os.environ.get("REWIND_IMAGE") or DEFAULT_IMAGE,
             snapshot_mode=os.environ.get("REWIND_SNAPSHOT_MODE", "mutating"),
             max_snapshots=_env_int("REWIND_MAX_SNAPSHOTS", DEFAULT_MAX_SNAPSHOTS),
-            network=os.environ.get("REWIND_NETWORK", "1") != "0",
+            network=settings.network_mode(),
+            # Hermes's own terminal.container_cpu / container_memory, as its Docker backend uses.
+            **settings.limits(container_config or {}),
             compact_mb=_env_int("REWIND_COMPACT_MB", DEFAULT_COMPACT_MB),
             docker_api=os.environ.get("REWIND_DOCKER_API", "1") != "0",
             background=os.environ.get("REWIND_BACKGROUND", "1") != "0",

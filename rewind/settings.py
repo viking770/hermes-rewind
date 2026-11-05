@@ -5,7 +5,10 @@ import os
 from pathlib import Path
 
 from . import store as store_mod
-from .environment import DEFAULT_EXPORT_MAX_MB, DEFAULT_KEEP_HOURS
+from .environment import (
+    DEFAULT_CPUS, DEFAULT_EXPORT_MAX_MB, DEFAULT_KEEP_HOURS, DEFAULT_MEMORY_MB, DEFAULT_PIDS_LIMIT,
+    NETWORK_MODES,
+)
 
 # Set once this process has created a Rewind sandbox, i.e. Rewind is the
 # terminal backend here. Hermes also exports TERMINAL_ENV in some setups.
@@ -51,5 +54,34 @@ def confirm_irreversible() -> bool:
     return os.environ.get("REWIND_CONFIRM_IRREVERSIBLE", "1") != "0"
 
 
+def network_mode() -> str:
+    """REWIND_NETWORK: internet (default: internet, but not this computer or the
+    LAN), none, or full (unrestricted). The old 1/0 mean internet/none."""
+    raw = os.environ.get("REWIND_NETWORK", "internet").strip().lower()
+    return {"1": "internet", "true": "internet", "on": "internet", "0": "none", "false": "none",
+            "off": "none"}.get(raw, raw if raw in NETWORK_MODES else "internet")
+
+
 def network_enabled() -> bool:
-    return os.environ.get("REWIND_NETWORK", "1") != "0"
+    return network_mode() != "none"
+
+
+def _limit(env_name: str, config: dict, key: str, default):
+    """A resource limit: REWIND_* env var, else Hermes's terminal.<key>, else the default."""
+    for raw in (os.environ.get(env_name), (config or {}).get(key)):
+        if raw in (None, ""):
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        return None if value <= 0 else value
+    return default
+
+
+def limits(container_config: dict) -> dict:
+    """cpus / memory_mb / pids_limit for a sandbox. 0 turns a limit off."""
+    cpus = _limit("REWIND_CPUS", container_config, "container_cpu", DEFAULT_CPUS)
+    memory = _limit("REWIND_MEMORY_MB", container_config, "container_memory", DEFAULT_MEMORY_MB)
+    pids = _limit("REWIND_PIDS_LIMIT", {}, "", DEFAULT_PIDS_LIMIT)
+    return {"cpus": cpus, "memory_mb": int(memory) if memory else None, "pids_limit": int(pids) if pids else None}

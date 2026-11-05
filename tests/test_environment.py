@@ -4,7 +4,7 @@ import time
 import unittest
 
 from rewind import RewindProvider, registry, tools
-from rewind.environment import RewindEnvironment, RewindError, _CWD_MARKER
+from rewind.environment import GUARD_IMAGE, RewindEnvironment, RewindError, _CWD_MARKER
 
 
 class FakeDocker:
@@ -20,6 +20,8 @@ class FakeDocker:
         self.timeout_exec = False
         self.diff_output = "C /workspace\nA /workspace/new.txt\n"
         self.image_info = {}  # image -> "size layers" for `docker image inspect`
+        self.guard_fails = False
+        self.guard_image_present = True
 
     def __call__(self, argv, timeout=None):
         assert argv[0] == "docker"
@@ -29,6 +31,10 @@ class FakeDocker:
             return 1, f"{verb} exploded"
         if verb == "run" and self.fail_images.intersection(argv):
             return 1, "image is broken"
+        if verb == "run" and GUARD_IMAGE in argv:
+            return (1, "iptables: not supported") if self.guard_fails else (0, "REWIND_GUARD_OK\n")
+        if verb == "image" and argv[2] == "inspect" and argv[-1] == GUARD_IMAGE and self.guard_image_present:
+            return 0, "100 3\n"
         if verb == "exec":
             if argv[-1] == "command -v bash":
                 return 0, "/bin/bash\n"
@@ -46,10 +52,17 @@ class FakeDocker:
         return [c[1] for c in self.calls]
 
 
+# Session ids the way Hermes makes them: long and random.
+ALICE = "local-" + "a" * 64
+BOB = "local-" + "b" * 64
+
+
 def make_env(fake, **kw):
     # Snapshot before each command, so call order is deterministic. Background
-    # snapshots have their own tests below.
+    # snapshots have their own tests below. The network guard adds docker calls
+    # of its own, so it is off here and tested in test_security.py.
     kw.setdefault("background", False)
+    kw.setdefault("network", "none")
     return RewindEnvironment(task_id="Demo Task", runner=fake, **kw)
 
 
@@ -458,39 +471,53 @@ class ToolTests(unittest.TestCase):
     def call(self, name, args=None, **kw):
         return json.loads(tools.HANDLERS[name](args or {}, **kw))
 
-    def test_tools_refuse_to_guess_between_sandboxes(self):
-        make_env(self.fake)
-        RewindEnvironment(task_id="other", runner=self.fake, background=False)
-        result = self.call("rewind_list", task_id="unknown")
+    def test_tools_never_act_on_another_sessions_sandbox(self):
+        # Even when it is the only sandbox running (the old fallback).
+        RewindEnvironment(task_id=f"session:agent:main:telegram:dm:{ALICE}", runner=self.fake, background=False)
+        result = self.call("rewind_list", task_id=BOB, session_id=BOB)
         self.assertFalse(result["ok"])
-        self.assertIn("won't guess", result["error"])
-        self.assertTrue(self.call("rewind_list", task_id="other")["ok"])
+        self.assertIn("no Rewind sandbox", result["error"])
+        self.assertTrue(self.call("rewind_list", task_id=ALICE, session_id=ALICE)["ok"])
+
+    def test_tools_find_hermes_session_keyed_sandbox(self):
+        # What Hermes really does: sandbox "session:<session key>", whose key
+        # ends with the session id that tool calls carry as task_id.
+        mine = RewindEnvironment(task_id=f"session:agent:main:local:dm:{ALICE}", runner=self.fake, background=False)
+        RewindEnvironment(task_id=f"session:agent:main:local:dm:{BOB}", runner=self.fake, background=False)
+        mine.execute("rm a")
+        listed = self.call("rewind_list", task_id=ALICE, session_id=ALICE)
+        self.assertEqual([s["id"] for s in listed["snapshots"]], ["s1"])
+
+    def test_short_ids_are_not_suffix_matched(self):
+        RewindEnvironment(task_id="session:agent:main:local:dm:x-1", runner=self.fake, background=False)
+        self.assertFalse(self.call("rewind_list", task_id="1")["ok"])
 
     def test_shared_sandbox_serves_any_task_id(self):
         # Hermes's default: one sandbox created as "default", tool calls with
-        # each session's own task_id.
+        # each session's own task_id. Hermes's own terminal tool uses it too.
         RewindEnvironment(task_id="default", runner=self.fake, background=False)
         self.assertTrue(self.call("rewind_list", task_id="session-123")["ok"])
 
     def test_tools_without_sandbox_return_error(self):
         result = self.call("rewind_list")
         self.assertFalse(result["ok"])
-        self.assertIn("terminal.backend rewind", result["error"])
+        self.assertIn("terminal.backend", result["error"])
 
     def test_tool_flow(self):
         env = make_env(self.fake)
         env.execute("rm -rf src")
-        listed = self.call("rewind_list")
+        mine = {"task_id": "Demo Task"}
+        listed = self.call("rewind_list", **mine)
         self.assertTrue(listed["ok"])
         self.assertEqual(listed["snapshots"][0]["id"], "s1")
-        snap = self.call("rewind_snapshot", {"label": "before refactor"})
+        snap = self.call("rewind_snapshot", {"label": "before refactor"}, **mine)
         self.assertEqual(snap["snapshot"]["label"], "before refactor")
-        restored = self.call("rewind_restore", {"snapshot_id": "s1"}, task_id="Demo Task")
+        restored = self.call("rewind_restore", {"snapshot_id": "s1"}, **mine)
         self.assertTrue(restored["ok"])
         self.assertEqual(restored["undo_with"], "s3")
-        changes = self.call("rewind_changes")
+        changes = self.call("rewind_changes", **mine)
         self.assertIn("A /workspace/new.txt", changes["changes"])
-        bad = self.call("rewind_restore", {"snapshot_id": "nope"})
+        bad = self.call("rewind_restore", {"snapshot_id": "nope"}, **mine)
         self.assertFalse(bad["ok"])
 
     def test_register_with_fake_ctx(self):

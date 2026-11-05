@@ -110,6 +110,17 @@ def resolve_endpoint(docker_bin: str, cli: Runner) -> Optional[str]:
     return None  # tcp://, ssh:// and the like stay with the CLI
 
 
+_UNITS = {"": 1, "b": 1, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}
+
+
+def _bytes(value: str) -> Optional[int]:
+    """`docker run --memory` style sizes ("512m", "4g", "1048576") -> bytes."""
+    value = value.strip().lower()
+    unit = value[-1] if value and value[-1] in _UNITS else ""
+    number = value[:-1] if unit else value
+    return int(number) * _UNITS[unit] if number.isdigit() else None
+
+
 def demux(raw: bytes) -> str:
     """Join Docker's multiplexed stdout/stderr frames in the order they arrived."""
     out = bytearray()
@@ -244,7 +255,7 @@ class ApiRunner:
     def _parse_run(self, rest: List[str]):
         if rest[:1] != ["-d"]:
             return None
-        name, labels, network, entrypoint = None, {}, None, None
+        name, labels, entrypoint, host = None, {}, None, {}
         i = 1
         while i < len(rest) and rest[i].startswith("-"):
             if i + 1 >= len(rest):
@@ -256,19 +267,31 @@ class ApiRunner:
                 key, _, val = value.partition("=")
                 labels[key] = val
             elif opt == "--network":
-                network = value
+                host["NetworkMode"] = value
             elif opt == "--entrypoint":
                 entrypoint = value
+            elif opt in ("--cap-drop", "--cap-add", "--security-opt"):
+                field = {"--cap-drop": "CapDrop", "--cap-add": "CapAdd", "--security-opt": "SecurityOpt"}[opt]
+                host.setdefault(field, []).append(value)
+            elif opt == "--pids-limit" and value.lstrip("-").isdigit():
+                host["PidsLimit"] = int(value)
+            elif opt == "--cpus":
+                try:
+                    host["NanoCpus"] = int(float(value) * 1e9)
+                except ValueError:
+                    return None
+            elif opt == "--memory" and _bytes(value) is not None:
+                host["Memory"] = _bytes(value)
             else:
-                return None
+                return None  # anything else: let the docker CLI handle it
             i += 2
         if not name or i >= len(rest):
             return None
         config = {"Image": rest[i], "Cmd": rest[i + 1:], "Labels": labels}
         if entrypoint:
             config["Entrypoint"] = [entrypoint]
-        if network:
-            config["HostConfig"] = {"NetworkMode": network}
+        if host:
+            config["HostConfig"] = host
         return lambda t: self._run(name, config, t)
 
     def _run(self, name: str, config: dict, timeout) -> Tuple[int, str]:

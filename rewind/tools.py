@@ -113,21 +113,17 @@ def _err(message: str) -> str:
 
 
 def _env(kwargs):
-    """The sandbox for this tool call. Hermes creates a sandbox with the
-    session's task_id when sessions are isolated (container_persistent: false)
-    and shares one otherwise, so an exact match or the only sandbox covers
-    both; anything else is refused rather than guessed."""
-    task_id = kwargs.get("task_id")
-    env = registry.get(task_id)
+    """The sandbox of the session making this tool call (see registry.find).
+
+    Never "whichever sandbox is running": in a gateway that serves several
+    people, that would let one chat's agent undo or read another's work. A
+    sandbox Hermes shares on purpose is allowed, because Hermes's own terminal
+    tool runs this caller's commands in it too."""
+    env = registry.find(kwargs.get("task_id"), kwargs.get("session_id"))
     if env is None:
-        if registry.count() > 1:
-            raise RewindError(
-                f"Several Rewind sandboxes are running and none belongs to task {task_id!r}, "
-                "so Rewind won't guess which one to act on."
-            )
         raise RewindError(
-            "No Rewind sandbox is running. Set `hermes config set terminal.backend rewind` "
-            "and run a terminal command first."
+            "This session has no Rewind sandbox yet. Run a terminal command first "
+            "(and check `hermes config get terminal.backend` says rewind)."
         )
     return env
 
@@ -244,15 +240,22 @@ def _session_keys(session_key=None, session_id=None) -> list:
                         session_id and f"session:{session_id}") if k]
 
 
-def _session_env(session_key=None, session_id=None):
-    keys = _session_keys(session_key, session_id)
-    for key in keys:
-        if key in registry.keys():
-            return registry.get(key)
-    env = registry.get(None)  # the only sandbox, if there is exactly one
+# Surfaces where the person typing is the person at this computer. On messaging
+# platforms (Telegram, Discord, Slack, ...) anyone in the chat can type /rewind.
+LOCAL_PLATFORMS = frozenset({"", "local", "cli", "tui", "desktop", "acp", "webui"})
+
+
+def is_local(platform) -> bool:
+    return str(platform or "").strip().lower() in LOCAL_PLATFORMS
+
+
+def _session_env(session_key=None, session_id=None, platform=None):
+    """This chat's own sandbox. The sandbox Hermes shares on purpose counts only
+    for local chats: from a messaging platform, /rewind never reaches a sandbox
+    that other chats use."""
+    env = registry.find(session_key, session_id, allow_shared=is_local(platform))
     if env is None:
-        if registry.count() > 1:
-            raise RewindError("Several Rewind sandboxes are running and none is this chat's.")
+        keys = _session_keys(session_key, session_id)
         raise RewindError(_paused_text(keys) or "This chat has no Rewind sandbox yet: run a terminal command first.")
     return env
 
@@ -291,8 +294,13 @@ def _format_snapshots(env) -> str:
     return "\n".join(lines)
 
 
-def slash_rewind(raw_args: str = "", session_key=None, session_id=None, **_ignored) -> str:
-    """Handler for /rewind. Runs Rewind directly; the model is not involved."""
+def slash_rewind(raw_args: str = "", session_key=None, session_id=None, platform=None, **_ignored) -> str:
+    """Handler for /rewind. Runs Rewind directly; the model is not involved.
+
+    From a messaging platform it only ever acts on that chat's own sandbox,
+    status shows no other chats, and export (which writes to this computer's
+    disk) is refused."""
+    local = is_local(platform)
     try:
         words = shlex.split(raw_args or "")
     except ValueError:
@@ -305,8 +313,11 @@ def slash_rewind(raw_args: str = "", session_key=None, session_id=None, **_ignor
         if sub in ("help", "-h", "--help"):
             return SLASH_HELP
         if sub == "status":
-            return _status_text() + stale
-        env = _session_env(session_key, session_id)
+            return _status_text(include_records=local) + stale
+        if sub == "export" and not local:
+            return ("Rewind: /rewind export writes to the Hermes host's disk, so it only works from a "
+                    "local chat (CLI, TUI or desktop app), not from a messaging platform.")
+        env = _session_env(session_key, session_id, platform)
         if sub in ("list", "ls"):
             return _format_snapshots(env) + stale
         if sub in ("undo", "restore"):
@@ -332,12 +343,14 @@ def slash_rewind(raw_args: str = "", session_key=None, session_id=None, **_ignor
 
 
 # ------------------------------------------------------------ status / gc
-def _status_text() -> str:
+def _status_text(include_records: bool = True) -> str:
     status = version.status()
     lines = [f"Rewind {status['version']}"]
     if status.get("warning"):
         lines.append(f"Warning: {status['warning']}")
     lines.append(f"Snapshots kept after a sandbox shuts down: {settings.keep_hours():g} h (REWIND_KEEP_HOURS)")
+    if not include_records:  # other chats' sandboxes are none of this chat's business
+        return "\n".join(lines)
     lines.append(f"State folder: {settings.state_dir()}")
     store = store_mod.Store(settings.state_dir())
     records = list(store.records())

@@ -72,6 +72,7 @@ class FilesDocker(FakeDocker):
 
 def make_env(fake, **kw):
     kw.setdefault("background", False)
+    kw.setdefault("network", "none")
     kw.setdefault("task_id", "session:demo")
     return RewindEnvironment(runner=fake, **kw)
 
@@ -330,7 +331,7 @@ class IrreversibleTests(unittest.TestCase):
 
     def test_execute_adds_a_note(self):
         registry.clear()
-        env = make_env(FilesDocker())
+        env = make_env(FilesDocker(), network="internet")
         self.assertIn("rewind_restore cannot take that back", env.execute("git push")["output"])
         self.assertNotIn("[rewind] note", env.execute("ls")["output"])
         offline = make_env(FilesDocker(), network=False, task_id="offline")
@@ -376,13 +377,13 @@ class VersionTests(unittest.TestCase):
     def test_tool_results_carry_version_and_warning(self):
         registry.clear()
         make_env(FilesDocker()).execute("rm a")
-        listed = json.loads(tools.HANDLERS["rewind_list"]({}))
+        listed = json.loads(tools.HANDLERS["rewind_list"]({}, task_id="demo"))
         self.assertEqual(listed["plugin_version"], version.VERSION)
         self.assertNotIn("warning", listed)
         saved = dict(version._LOADED)
         try:
             version._LOADED["environment.py"] = 1
-            listed = json.loads(tools.HANDLERS["rewind_list"]({}))
+            listed = json.loads(tools.HANDLERS["rewind_list"]({}, task_id="demo"))
             self.assertIn("warning", listed)
         finally:
             version._LOADED.clear()
@@ -398,8 +399,8 @@ class UndoToolAndSlashTests(unittest.TestCase):
         env = make_env(self.fake)
         env.execute("mkdir demo")
         env.execute("rm -rf demo")
-        first = json.loads(tools.HANDLERS["rewind_undo"]({}))
-        second = json.loads(tools.HANDLERS["rewind_undo"]({}))
+        first = json.loads(tools.HANDLERS["rewind_undo"]({}, task_id="demo"))
+        second = json.loads(tools.HANDLERS["rewind_undo"]({}, task_id="demo"))
         self.assertEqual(first["restored"]["id"], "s2")
         self.assertEqual(second["restored"]["id"], "s2")
         self.assertIn("files", first)
@@ -408,7 +409,7 @@ class UndoToolAndSlashTests(unittest.TestCase):
         env = make_env(self.fake)
         env.execute("rm -rf demo")
         self.fake.files[f"{env.repository}:s1"] = ["demo/hello.txt"]
-        result = json.loads(tools.HANDLERS["rewind_restore"]({"snapshot_id": "last", "preview": True}))
+        result = json.loads(tools.HANDLERS["rewind_restore"]({"snapshot_id": "last", "preview": True}, task_id="demo"))
         self.assertTrue(result["ok"])
         self.assertIn("Nothing was restored", result["message"])
         self.assertEqual(result["files"]["appear"], ["demo/hello.txt"])
@@ -417,12 +418,12 @@ class UndoToolAndSlashTests(unittest.TestCase):
         make_env(self.fake)
         os.environ["REWIND_EXPORT_DIR"] = tempfile.mkdtemp()
         try:
-            result = json.loads(tools.HANDLERS["rewind_export"]({"path": "app"}))
+            result = json.loads(tools.HANDLERS["rewind_export"]({"path": "app"}, task_id="demo"))
         finally:
             del os.environ["REWIND_EXPORT_DIR"]
         self.assertTrue(result["ok"], result)
         self.assertTrue(result["host_path"].endswith("app"))
-        self.assertFalse(json.loads(tools.HANDLERS["rewind_export"]({}))["ok"])
+        self.assertFalse(json.loads(tools.HANDLERS["rewind_export"]({}, task_id="demo"))["ok"])
 
     def test_slash_command(self):
         env = RewindEnvironment(task_id="session:chat-1", runner=self.fake, background=False)
@@ -441,8 +442,39 @@ class UndoToolAndSlashTests(unittest.TestCase):
         self.assertIn("Unknown /rewind command", tools.slash_rewind("dance", session_key="chat-1"))
         self.assertIn("/rewind undo", tools.slash_rewind("help"))
         self.assertIn("Rewind 0.", tools.slash_rewind("status"))
-        # Two sandboxes and no match: refuse rather than guess.
-        self.assertIn("none is this chat's", tools.slash_rewind("undo", session_key="chat-9"))
+        # No match: refuse rather than guess.
+        self.assertIn("no Rewind sandbox", tools.slash_rewind("undo", session_key="chat-9"))
+
+    def test_slash_command_from_a_messaging_platform(self):
+        """Another person in a Telegram chat must not reach someone else's sandbox."""
+        alice = RewindEnvironment(task_id="session:agent:main:telegram:dm:alice-chat-0001",
+                                  runner=self.fake, background=False)
+        alice.execute("rm -rf work")
+        # Bob's chat: the only sandbox running is Alice's. Before 0.2.1 this undid her work.
+        bob = dict(session_key="agent:main:telegram:dm:bob-chat-0002", session_id="bob-chat-0002",
+                   platform="telegram")
+        self.assertIn("no Rewind sandbox", tools.slash_rewind("undo", **bob))
+        self.assertIn("no Rewind sandbox", tools.slash_rewind("list", **bob))
+        self.assertEqual(len(alice.snapshots), 1)  # untouched
+        # Alice in her own chat still can, but export (host disk) is local-only.
+        mine = dict(session_key="agent:main:telegram:dm:alice-chat-0001", platform="telegram")
+        self.assertIn("Rolled back", tools.slash_rewind("undo", **mine))
+        self.assertIn("only works from a local chat", tools.slash_rewind("export work", **mine))
+        self.assertNotIn("cp", self.fake.verbs())
+        # status from a platform shows no other chats.
+        Store(Path(os.environ["REWIND_STATE_DIR"])).save({"task_id": "someone-else", "status": "parked"})
+        try:
+            self.assertNotIn("someone-else", tools.slash_rewind("status", platform="telegram"))
+            self.assertIn("someone-else", tools.slash_rewind("status", platform="local"))
+        finally:
+            Store(Path(os.environ["REWIND_STATE_DIR"])).delete("someone-else")
+
+    def test_shared_sandbox_only_for_local_slash_commands(self):
+        RewindEnvironment(task_id="default", runner=self.fake, background=False).execute("rm a")
+        local = tools.slash_rewind("list", session_key="agent:main:local:dm:x", platform="local")
+        self.assertIn("rm a", local)
+        remote = tools.slash_rewind("list", session_key="agent:main:discord:dm:x", platform="discord")
+        self.assertIn("no Rewind sandbox", remote)
 
     def test_slash_command_explains_a_paused_sandbox(self):
         store = Store(Path(os.environ["REWIND_STATE_DIR"]))
