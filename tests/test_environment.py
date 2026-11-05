@@ -210,6 +210,45 @@ class EnvironmentTests(unittest.TestCase):
         with self.assertRaises(RewindError):
             env.restore("s99")
 
+    def test_repeated_restore_last_does_not_undo_itself(self):
+        # The demo that went wrong: create, delete, then "undo" twice.
+        env = make_env(self.fake)
+        env.execute("mkdir demo")             # s1: before mkdir
+        env.execute("rm -rf demo")            # s2: before rm, still has demo
+        first, safety1 = env.restore("last")
+        self.assertEqual(first.id, "s2")
+        self.assertTrue(safety1.restore_point)
+        second, safety2 = env.restore("last")
+        self.assertEqual(second.id, "s2")     # not safety1, which has demo deleted
+        self.assertTrue(safety2.restore_point)
+        # Undoing a restore still works with its explicit id.
+        undone, _ = env.restore(safety1.id)
+        self.assertEqual(undone.id, safety1.id)
+        # A new change after a restore becomes "last".
+        env.execute("rm -rf demo")
+        self.assertFalse(env.find("last").restore_point)
+        self.assertEqual(env.find("last").command, "rm -rf demo")
+
+    def test_restore_last_with_only_restore_points_asks_for_an_id(self):
+        env = make_env(self.fake)
+        env.execute("rm a")
+        env.restore("s1")
+        env.snapshots = [s for s in env.snapshots if s.restore_point]
+        with self.assertRaises(RewindError) as ctx:
+            env.find("last")
+        self.assertIn("snapshot id", str(ctx.exception))
+
+    def test_describe_says_state_before_command(self):
+        env = make_env(self.fake)
+        env.execute("rm -rf demo")
+        env.snapshot("before refactor")
+        _, safety = env.restore("s1")
+        states = {s["id"]: s["state"] for s in env.list_snapshots()}
+        self.assertEqual(states["s1"], "state before running: rm -rf demo")
+        self.assertEqual(states["s2"], "checkpoint: before refactor")
+        self.assertIn("before restoring s1", states[safety.id])
+        self.assertIn("undo that restore", states[safety.id])
+
     def test_prune_keeps_manual_snapshots(self):
         env = make_env(self.fake, max_snapshots=2)
         env.snapshot("keep me")

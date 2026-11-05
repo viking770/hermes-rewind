@@ -15,7 +15,9 @@ SCHEMAS = {
         "name": "rewind_list",
         "description": (
             "List the snapshots of the Rewind sandbox. Rewind snapshots automatically before "
-            "every command that can change files, so each entry is a point you can roll back to."
+            "every command that can change files, so each entry is a point you can roll back to. "
+            "A snapshot holds the state from BEFORE its command ran: the snapshot listed with "
+            "`rm -rf x` still contains x. Read each entry's `state` field."
         ),
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
@@ -32,7 +34,10 @@ SCHEMAS = {
         "name": "rewind_restore",
         "description": (
             "Roll the sandbox back to a snapshot. Use 'last' to undo the most recent change. "
-            "The current state is saved first, so a restore can itself be undone."
+            "Call it once: calling 'last' again does not undo further, it restores the same "
+            "snapshot again. The current state is saved first; to undo a restore, pass the "
+            "`undo_with` id it returned. The terminal runs in this same sandbox, so the restored "
+            "files are what the next command sees."
         ),
         "parameters": {
             "type": "object",
@@ -116,7 +121,10 @@ def rewind_restore(args, **kwargs):
     return _ok(
         restored=target.describe(),
         undo_with=safety.id,
-        message=f"Sandbox rolled back to {target.id}. Restore {safety.id} to undo this rollback.",
+        message=(
+            f"Sandbox rolled back to {target.id} ({target.state()}). The terminal now sees this "
+            f"state. Do not restore again unless asked; to undo this rollback, restore {safety.id}."
+        ),
     )
 
 

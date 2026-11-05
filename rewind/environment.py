@@ -62,11 +62,24 @@ class Snapshot:
     cwd: str
     created_at: float
     auto: bool
+    # Saved by restore() just before it rolled back, so the restore can be
+    # undone. "last" skips these, so repeating a restore is harmless.
+    restore_point: bool = False
 
     def describe(self) -> dict:
         info = asdict(self)
         info["age_seconds"] = round(time.time() - self.created_at, 1)
+        info["state"] = self.state()
         return info
+
+    def state(self) -> str:
+        """What the snapshot holds, in words. A snapshot is the state *before*
+        its command ran, which models (and people) easily misread."""
+        if self.restore_point:
+            return f"{self.label} (restore this to undo that restore)"
+        if self.auto and self.command:
+            return f"state before running: {self.command}"
+        return f"checkpoint: {self.label}"
 
 
 @dataclass
@@ -278,15 +291,20 @@ class RewindEnvironment:
             self._start_background()
             return snap
 
-    def _take_snapshot(self, *, label: str, command: str, auto: bool, compact: bool = True) -> Snapshot:
+    def _take_snapshot(
+        self, *, label: str, command: str, auto: bool, compact: bool = True, restore_point: bool = False
+    ) -> Snapshot:
         """Record the current state as a snapshot: the pending background one if
         there is one (it already holds this state), otherwise a fresh commit."""
-        if self._pending is not None:
-            pending, self._pending = self._pending, None
-            snap = Snapshot(pending.id, pending.image, label, command, pending.cwd, pending.created_at, auto)
-        else:
+        fresh = self._pending is None
+        if fresh:
             pending = self._commit()
-            snap = Snapshot(pending.id, pending.image, label, command, pending.cwd, pending.created_at, auto)
+        else:
+            pending, self._pending = self._pending, None
+        snap = Snapshot(
+            pending.id, pending.image, label, command, pending.cwd, pending.created_at, auto, restore_point
+        )
+        if fresh:
             if compact:
                 self._maybe_compact(snap.image)
         self.snapshots.append(snap)
@@ -374,9 +392,18 @@ class RewindEnvironment:
 
     def find(self, snapshot_id: str) -> Snapshot:
         if snapshot_id in ("last", "latest", ""):
-            if not self.snapshots:
-                raise RewindError("There are no snapshots yet.")
-            return self.snapshots[-1]
+            # The newest snapshot that isn't a restore's undo point. Otherwise a
+            # second restore("last") would pick the state saved by the first
+            # one and undo it. Undoing a restore takes its explicit id.
+            for snap in reversed(self.snapshots):
+                if not snap.restore_point:
+                    return snap
+            if self.snapshots:
+                raise RewindError(
+                    "The only snapshots are ones saved before a restore. Pass a snapshot id "
+                    "from rewind_list to restore one of them."
+                )
+            raise RewindError("There are no snapshots yet.")
         for snap in self.snapshots:
             if snap.id == snapshot_id:
                 return snap
@@ -392,7 +419,8 @@ class RewindEnvironment:
             target = self.find(snapshot_id)
             # No compaction: the container is replaced right after anyway.
             safety = self._take_snapshot(
-                label=f"before restoring {target.id}", command="", auto=False, compact=False
+                label=f"before restoring {target.id}", command="", auto=False, compact=False,
+                restore_point=True,
             )
             self._docker("rm", "-f", self.container, timeout=60)
             self._started = False
