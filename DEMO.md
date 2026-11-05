@@ -6,8 +6,10 @@
 
 **30–50s.** The disaster: "Clean up everything except the source." The agent runs a broad `rm -rf` and the tests now fail. (Stage it with a prompt that makes this plausible, or tell it to do it on camera.)
 
-**50–70s.** "Undo that." The agent calls `rewind_restore("last")`. The tests pass again, and `rewind_changes` shows the files came back.
+**50–65s.** Type `/rewind` to show the snapshots ("state before running: rm -rf …"), then `/rewind undo`. No model involved: Rewind answers at once with which files came back, and the tests pass again. Optionally ask the agent to "undo that" instead and show it calling `rewind_undo`.
 
-**70–85s.** Undo the undo: restore the safety snapshot to show that a rollback is itself reversible.
+**65–75s.** Undo the undo: `/rewind restore s<N>` with the id the undo printed, to show that a rollback is itself reversible.
+
+**75–85s.** Safety net for what files can't cover: ask the agent to `git push`. Hermes stops and asks first, with Rewind's message that a push can't be undone.
 
 **85–90s.** End card: "Every command reversible. `hermes plugins install …/hermes-rewind`". Tag @NousResearch.

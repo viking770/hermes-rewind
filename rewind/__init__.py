@@ -12,18 +12,27 @@ Optional settings (environment variables):
     REWIND_COMPACT_MB     compact snapshots once changes pass this size (default 256, 0 = never)
     REWIND_DOCKER_API     set to 0 to always use the docker CLI instead of the Engine API
     REWIND_BACKGROUND     set to 0 to snapshot right before each command instead of in the background
+    REWIND_KEEP_HOURS     keep snapshots this long after the sandbox shuts down (default 24, 0 = delete)
+    REWIND_STATE_DIR      where parked-sandbox records live (default <HERMES_HOME>/rewind)
+    REWIND_EXPORT_DIR     where rewind_export copies files (default <state dir>/exports)
+    REWIND_EXPORT_MAX_MB  largest export allowed (default 500)
+    REWIND_CONFIRM_IRREVERSIBLE  set to 0 to stop asking before commands Rewind can't undo
+    REWIND_AUTO_GC        set to 0 to stop the automatic cleanup of expired snapshots and leftovers
 """
 from __future__ import annotations
 
 import os
 import shutil
+import threading
+import time
 
 try:
     from agent.terminal_env_provider import TerminalEnvironmentProvider
 except ImportError:  # imported outside Hermes, e.g. by the unit tests
     from ._compat import TerminalEnvironmentProvider
 
-from . import tools
+from . import settings, tools, version
+from .store import Store
 from .environment import (
     DEFAULT_COMPACT_MB,
     DEFAULT_CWD,
@@ -75,10 +84,17 @@ class RewindProvider(TerminalEnvironmentProvider):
 
     def doctor_checks(self) -> list:
         ok = self.is_available()
-        return [(ok, "Rewind backend", "(docker found)" if ok else "(docker CLI not found on PATH)")]
+        status = version.status()
+        return [
+            (ok, "Rewind backend", "(docker found)" if ok else "(docker CLI not found on PATH)"),
+            (not status["stale"], f"Rewind {status['version']} loaded",
+             f"({status['warning']})" if status["stale"] else "(matches the files on disk)"),
+        ]
 
     def create_environment(self, *, cwd, timeout, task_id="default", image=None, container_config=None, **kwargs):
-        return RewindEnvironment(
+        settings.mark_backend_used()
+        keep = settings.keep_hours()
+        env = RewindEnvironment(
             cwd=cwd if cwd and cwd != "~" else DEFAULT_CWD,
             timeout=timeout,
             task_id=task_id,
@@ -89,7 +105,37 @@ class RewindProvider(TerminalEnvironmentProvider):
             compact_mb=_env_int("REWIND_COMPACT_MB", DEFAULT_COMPACT_MB),
             docker_api=os.environ.get("REWIND_DOCKER_API", "1") != "0",
             background=os.environ.get("REWIND_BACKGROUND", "1") != "0",
+            keep_hours=keep,
+            store=Store(settings.state_dir()) if keep > 0 else None,
+            export_max_mb=settings.export_max_mb(),
         )
+        _maybe_gc()
+        return env
+
+
+_GC_EVERY_SECONDS = 600
+_last_gc = 0.0
+_gc_lock = threading.Lock()
+
+
+def _maybe_gc() -> None:
+    """Clean up expired snapshots and crashed sessions' leftovers, at most every
+    10 minutes, in the background so a new sandbox never waits for it."""
+    global _last_gc
+    if os.environ.get("REWIND_AUTO_GC", "1") == "0":
+        return
+    with _gc_lock:
+        if time.time() - _last_gc < _GC_EVERY_SECONDS:
+            return
+        _last_gc = time.time()
+
+    def work() -> None:
+        try:
+            tools.run_gc()
+        except Exception:
+            pass  # best effort; `hermes rewind gc` reports problems
+
+    threading.Thread(target=work, name="rewind-gc", daemon=True).start()
 
 
 def register(ctx) -> None:

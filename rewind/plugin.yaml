@@ -1,12 +1,16 @@
 name: rewind
-version: 0.1.0
-description: Undoable Docker sandbox terminal backend. Every command that can change files is snapshotted first, so the agent (or you) can roll the sandbox back.
+version: 0.2.0
+description: Undoable Docker sandbox terminal backend. Every command that can change files is snapshotted first, so the agent (or you, with /rewind) can roll the sandbox back.
 author: Vikram Singh
 kind: backend
 # Oldest version tested end to end (catalog rule 14).
 requires_hermes: ">=0.22.7"
 provides_tools:
+  - rewind_undo
   - rewind_list
   - rewind_snapshot
   - rewind_restore
   - rewind_changes
+  - rewind_export
+provides_hooks:
+  - pre_tool_call

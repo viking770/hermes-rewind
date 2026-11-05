@@ -9,6 +9,8 @@ plugin has no Python dependencies.
 from __future__ import annotations
 
 import base64
+import os
+import posixpath
 import re
 import shlex
 import subprocess
@@ -16,15 +18,25 @@ import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from . import policy, registry
+from . import policy, registry, store as store_mod
 from .docker_api import ApiRunner
+from .store import Store
 
 DEFAULT_IMAGE = "python:3.12-slim"
 DEFAULT_CWD = "/workspace"
 DEFAULT_MAX_SNAPSHOTS = 25
 DEFAULT_COMPACT_MB = 256
+DEFAULT_KEEP_HOURS = 24
+DEFAULT_EXPORT_MAX_MB = 500
+# Lists files under /workspace as "path<TAB>size<TAB>mtime" for restore summaries.
+_LIST_FILES = (
+    f"cd {DEFAULT_CWD} 2>/dev/null && find . -xdev \\( -type f -o -type l \\) "
+    "-printf '%P\\t%s\\t%T@\\n' 2>/dev/null | head -n 20000"
+)
+_SUMMARY_LIMIT = 20
 # overlay2 refuses images deeper than ~125 layers. Each compaction adds one,
 # so stop compacting well before that and let snapshots grow instead.
 MAX_LAYERS = 100
@@ -65,6 +77,14 @@ class Snapshot:
     # Saved by restore() just before it rolled back, so the restore can be
     # undone. "last" skips these, so repeating a restore is harmless.
     restore_point: bool = False
+    # The image the container was started from when this was committed. The
+    # snapshot's own data is roughly its size minus the parent's.
+    parent: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Snapshot":
+        fields = cls.__dataclass_fields__
+        return cls(**{k: v for k, v in data.items() if k in fields})
 
     def describe(self) -> dict:
         info = asdict(self)
@@ -89,6 +109,7 @@ class _Pending:
     image: str
     cwd: str
     created_at: float
+    parent: str = ""
 
 
 class RewindEnvironment:
@@ -109,6 +130,9 @@ class RewindEnvironment:
         background: bool = True,
         runner: Optional[Runner] = None,
         docker_bin: str = "docker",
+        keep_hours: float = 0,
+        store: Optional[Store] = None,
+        export_max_mb: int = DEFAULT_EXPORT_MAX_MB,
     ) -> None:
         if snapshot_mode not in policy.MODES:
             raise ValueError(f"snapshot_mode must be one of {policy.MODES}, got {snapshot_mode!r}")
@@ -152,6 +176,18 @@ class RewindEnvironment:
         self._worker: Optional[threading.Thread] = None
         self._cwd_from_restore = False
         self._lock = threading.RLock()
+        # Parking (see store.py): with a store and keep_hours > 0, cleanup()
+        # keeps the snapshots so the next sandbox for this task resumes them.
+        self.keep_seconds = max(0.0, float(keep_hours)) * 3600
+        self._store = store
+        self.export_max_mb = export_max_mb
+        self._note = ""  # said once, with the next command's output
+        self.last_restore_changes: Optional[dict] = None
+        if store is not None:
+            try:
+                self._adopt()
+            except (OSError, ValueError, KeyError, TypeError):
+                pass  # a damaged record must never stop the sandbox from starting
         registry.add(task_id, self)
 
     # ------------------------------------------------------------------ docker
@@ -167,6 +203,10 @@ class RewindEnvironment:
             "--name", self.container,
             "--label", "hermes.rewind=1",
             "--label", f"hermes.rewind.task={self.task_id}",
+            # Who owns it, so a later Rewind can tell a crashed owner's leftovers
+            # from a sandbox another live process is using (store.reap).
+            "--label", f"{store_mod.PID_LABEL}={os.getpid()}",
+            "--label", f"{store_mod.HOST_LABEL}={store_mod.hostname()}",
         ]
         if not self.network:
             argv += ["--network", "none"]
@@ -189,6 +229,60 @@ class RewindEnvironment:
         code, _ = self._docker("exec", self.container, "sh", "-c", "command -v bash", check=False)
         self._shell = "bash" if code == 0 else "sh"
         self._started = True
+        self._persist()
+
+    # ------------------------------------------------------------- persisting
+    def _record(self, status: str) -> dict:
+        return {
+            "task_id": self.task_id, "status": status, "repository": self.repository,
+            "container": self.container if status == "live" else None,
+            "owner_pid": os.getpid() if status == "live" else None, "host": store_mod.hostname(),
+            "base_image": self.base_image, "image": self._image, "seq": self._seq, "cwd": self.cwd,
+            "snapshots": [asdict(s) for s in self.snapshots], "dropped_images": list(self._dropped_images),
+            "carried_changes": dict(self._carried_changes),
+        }
+
+    def _persist(self) -> None:
+        """Keep the on-disk record current while live, so a crash loses as little as possible."""
+        if self._store is None or self.keep_seconds <= 0:
+            return
+        try:
+            self._store.save(self._record("live"))
+        except OSError:
+            pass
+
+    def _adopt(self) -> None:
+        """Pick up the snapshots a previous sandbox for this task parked."""
+        record = self._store.load(self.task_id)
+        if not record or store_mod.is_expired(record):
+            return
+        if record.get("status") == "live":
+            if record.get("host") != store_mod.hostname() or store_mod.pid_alive(record.get("owner_pid")):
+                return  # another live process owns it
+            old = record.get("container")
+            if old:  # its owner died: keep the state it was in
+                code, _ = self._docker("commit", "--message", "rewind recovered", old,
+                                       f"{record['repository']}:recovered", timeout=300, check=False)
+                if code == 0:
+                    record["image"] = f"{record['repository']}:recovered"
+                self._docker("rm", "-f", old, timeout=60, check=False)
+        image = record.get("image") or ""
+        if not image or self._inspect_image(image) == (0, 0):
+            return  # the images are gone (pruned by hand?): start fresh
+        self.repository = record["repository"]
+        self._seq = int(record.get("seq", 0))
+        self.snapshots = [Snapshot.from_dict(s) for s in record.get("snapshots", [])]
+        self._dropped_images = list(record.get("dropped_images", []))
+        self._carried_changes = dict(record.get("carried_changes", {}))
+        self._image = image
+        cwd = record.get("cwd") or self.cwd
+        self.cwd = cwd if cwd.startswith("/") else self.cwd
+        self._cwd_from_restore = True  # the resumed directory wins over Hermes's default once
+        age = time.time() - float(record.get("parked_at") or record.get("updated_at") or time.time())
+        self._note = (
+            f"[rewind] Resumed this session's sandbox from {_ago(age)} ago with "
+            f"{len(self.snapshots)} snapshot(s); earlier changes can still be undone.\n"
+        )
 
     # ----------------------------------------------------------- environment
     def execute(
@@ -214,12 +308,17 @@ class RewindEnvironment:
             except (RewindError, subprocess.TimeoutExpired, OSError) as exc:
                 return _result(f"[rewind] could not start the sandbox: {exc}", 1)
 
-            note = ""
+            note, self._note = self._note, ""
             if policy.should_snapshot(command, self.snapshot_mode):
                 try:
                     self._take_snapshot(label="auto", command=command, auto=True)
                 except (RewindError, subprocess.TimeoutExpired, OSError) as exc:
-                    note = f"[rewind] warning: snapshot failed, so this command cannot be undone ({exc})\n"
+                    note += f"[rewind] warning: snapshot failed, so this command cannot be undone ({exc})\n"
+            outside = policy.irreversible_reason(command) if self.network else None
+            after = (
+                f"\n[rewind] note: {outside}. Snapshots only cover files in this sandbox, "
+                "so rewind_restore cannot take that back." if outside else ""
+            )
             try:
                 self._ensure_started()  # in case a compaction could not restart it
             except (RewindError, subprocess.TimeoutExpired, OSError) as exc:
@@ -246,7 +345,7 @@ class RewindEnvironment:
             # what to do. A read-only command leaves the pending snapshot valid.
             if self._pending is None:
                 self._start_background()
-            return _result(note + output, code, new_cwd)
+            return _result(note + output + after, code, new_cwd)
 
     def _stage_stdin(self, data: str) -> str:
         """Write ``data`` to a temp file in the sandbox and return its path.
@@ -266,20 +365,65 @@ class RewindEnvironment:
         return path
 
     def cleanup(self) -> None:
+        """Called by Hermes when the session ends *and* when its idle reaper shuts
+        the sandbox down, which look the same from here. So with parking on, keep
+        the snapshots for keep_hours and let the next sandbox resume them."""
         with self._lock:
             self._finish_background()
-            if self._started:
-                self._docker("rm", "-f", self.container, timeout=60, check=False)
-                self._started = False
-            images = [s.image for s in self.snapshots] + self._dropped_images
-            if self._pending is not None:
-                images.append(self._pending.image)
-                self._pending = None
-            if images:
-                self._docker("rmi", "-f", *images, timeout=120, check=False)
-            self.snapshots.clear()
-            self._dropped_images.clear()
-            registry.remove(self)
+            if self._store is not None and self.keep_seconds > 0 and self.snapshots:
+                try:
+                    self._park()
+                    registry.remove(self)
+                    return
+                except (RewindError, subprocess.TimeoutExpired, OSError):
+                    pass  # couldn't park: clean up fully rather than leak
+            self._delete_everything()
+
+    def _park(self) -> None:
+        previous = self._image
+        if self._started:
+            if self._pending is not None:  # already holds the current state
+                state, self._pending = self._pending.image, None
+            else:
+                state = self._commit().image
+            self._docker("rm", "-f", self.container, timeout=60)
+            self._started = False
+            self._image = state
+        keep = {s.image for s in self.snapshots} | {self._image, self.base_image}
+        if previous not in keep:  # an earlier parked state, now superseded
+            self._dropped_images.append(previous)
+        if self._dropped_images:
+            self._docker("rmi", "-f", *self._dropped_images, timeout=120, check=False)
+            self._dropped_images = [i for i in self._dropped_images if self._inspect_image_exists(i)]
+        record = self._record("parked")
+        now = time.time()
+        record.update(parked_at=now, expires_at=now + self.keep_seconds)
+        self._store.save(record)
+
+    def _inspect_image_exists(self, image: str) -> bool:
+        self._image_info.pop(image, None)
+        return self._inspect_image(image) != (0, 0)
+
+    def _delete_everything(self) -> None:
+        if self._started:
+            self._docker("rm", "-f", self.container, timeout=60, check=False)
+            self._started = False
+        images = [s.image for s in self.snapshots] + self._dropped_images
+        if self._pending is not None:
+            images.append(self._pending.image)
+            self._pending = None
+        if self._image != self.base_image and self._image not in images:
+            images.append(self._image)  # a resumed or compacted state
+        if images:
+            self._docker("rmi", "-f", *images, timeout=120, check=False)
+        self.snapshots.clear()
+        self._dropped_images.clear()
+        if self._store is not None:
+            try:
+                self._store.delete(self.task_id)
+            except OSError:
+                pass
+        registry.remove(self)
 
     # -------------------------------------------------------------- snapshots
     def snapshot(self, label: str = "manual") -> Snapshot:
@@ -302,21 +446,24 @@ class RewindEnvironment:
         else:
             pending, self._pending = self._pending, None
         snap = Snapshot(
-            pending.id, pending.image, label, command, pending.cwd, pending.created_at, auto, restore_point
+            pending.id, pending.image, label, command, pending.cwd, pending.created_at, auto, restore_point,
+            pending.parent,
         )
         if fresh:
             if compact:
                 self._maybe_compact(snap.image)
         self.snapshots.append(snap)
         self._prune()
+        self._persist()
         return snap
 
     def _commit(self) -> _Pending:
         self._seq += 1
         sid = f"s{self._seq}"
         image = f"{self.repository}:{sid}"
+        parent = self._image
         self._docker("commit", "--message", f"rewind {sid}", self.container, image, timeout=300)
-        return _Pending(sid, image, self.cwd, time.time())
+        return _Pending(sid, image, self.cwd, time.time(), parent)
 
     # ------------------------------------------------- background snapshots
     def _start_background(self) -> None:
@@ -417,6 +564,7 @@ class RewindEnvironment:
             self._finish_background()
             self._ensure_started()
             target = self.find(snapshot_id)
+            before = self._list_files_in_container()
             # No compaction: the container is replaced right after anyway.
             safety = self._take_snapshot(
                 label=f"before restoring {target.id}", command="", auto=False, compact=False,
@@ -444,8 +592,86 @@ class RewindEnvironment:
             self._carried_changes.clear()
             self.cwd = target.cwd
             self._cwd_from_restore = True
+            after = self._list_files_in_container()
+            self.last_restore_changes = _file_changes(before, after)
+            self._persist()
             self._start_background()  # ready for the first change after the restore
             return target, safety
+
+    def undo(self) -> Tuple[Snapshot, Snapshot]:
+        """Undo the most recent change: restore("last")."""
+        return self.restore("last")
+
+    def preview(self, snapshot_id: str) -> Tuple[Snapshot, Optional[dict]]:
+        """What restoring ``snapshot_id`` would change under /workspace, without restoring.
+        The dict is None when the file lists couldn't be read."""
+        with self._lock:
+            self._finish_background()
+            self._ensure_started()
+            target = self.find(snapshot_id)
+            before = self._list_files_in_container()
+            after = self._list_files_in_image(target.image)
+            # Nothing changed, so any waiting background snapshot is still valid.
+            return target, _file_changes(before, after)
+
+    # ------------------------------------------------------------ file lists
+    def _list_files_in_container(self) -> Optional[Dict[str, str]]:
+        try:
+            code, out = self._docker("exec", self.container, "sh", "-c", _LIST_FILES, timeout=60, check=False)
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        return _parse_listing(out) if code == 0 else None
+
+    def _list_files_in_image(self, image: str) -> Optional[Dict[str, str]]:
+        try:
+            code, out = self._docker("run", "--rm", "--network", "none", "--entrypoint", "sh", image,
+                                     "-c", _LIST_FILES, timeout=120, check=False)
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        return _parse_listing(out) if code == 0 else None
+
+    # ----------------------------------------------------------------- export
+    def export(self, path: str, dest_root: Path) -> Path:
+        """Copy ``path`` (a file or folder in the sandbox) to a new folder under
+        ``dest_root`` on the host and return the copy's host path. Never
+        overwrites: each export gets its own timestamped folder."""
+        with self._lock:
+            self._finish_background()
+            self._ensure_started()
+            src = posixpath.normpath(path if path.startswith("/") else posixpath.join(self.cwd, path))
+            code, out = self._docker("exec", self.container, "sh", "-c",
+                                     f"test -e {shlex.quote(src)} && du -sk {shlex.quote(src)} | cut -f1",
+                                     timeout=120, check=False)
+            if code != 0:
+                raise RewindError(f"{src} does not exist in the sandbox.")
+            try:
+                size_kb = int(out.strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                size_kb = 0
+            if self.export_max_mb and size_kb > self.export_max_mb * 1024:
+                raise RewindError(
+                    f"{src} is {size_kb // 1024} MB, over the {self.export_max_mb} MB export limit "
+                    "(REWIND_EXPORT_MAX_MB)."
+                )
+            slug = _SLUG.sub("-", self.task_id.lower()).strip("-")[-40:] or "task"
+            dest = Path(dest_root) / slug / time.strftime("%Y%m%d-%H%M%S")
+            n = 1
+            while dest.exists():
+                n += 1
+                dest = dest.with_name(f"{dest.name.split('_')[0]}_{n}")
+            dest.mkdir(parents=True)
+            self._docker("cp", f"{self.container}:{src}", str(dest), timeout=600)
+            name = posixpath.basename(src.rstrip("/")) or "root"
+            return dest / name
+
+    # ------------------------------------------------------------- disk usage
+    def snapshot_size(self, snap: Snapshot) -> Optional[int]:
+        """Roughly how many bytes this snapshot adds: its size minus its parent's."""
+        size, _ = self._inspect_image(snap.image)
+        if not size or not snap.parent:
+            return None
+        parent_size, _ = self._inspect_image(snap.parent)
+        return max(0, size - parent_size) if parent_size else None
 
     def changes(self, limit: int = 200) -> List[str]:
         """Filesystem changes since the sandbox was created or last restored."""
@@ -457,9 +683,16 @@ class RewindEnvironment:
             _merge_diff(merged, out)
             return [f"{kind} {path}" for path, kind in sorted(merged.items())][:limit]
 
-    def list_snapshots(self) -> List[dict]:
+    def list_snapshots(self, sizes: bool = False) -> List[dict]:
         with self._lock:
-            return [s.describe() for s in self.snapshots]
+            listed = []
+            for snap in self.snapshots:
+                info = snap.describe()
+                if sizes:
+                    size = self.snapshot_size(snap)
+                    info["size_mb"] = round(size / 1e6, 1) if size is not None else None
+                listed.append(info)
+            return listed
 
 
 def _merge_diff(changes: Dict[str, str], diff: str) -> None:
@@ -477,6 +710,56 @@ def _merge_diff(changes: Dict[str, str], diff: str) -> None:
             changes[path] = "C"  # deleted, then recreated
         else:
             changes[path] = kind
+
+
+def _parse_listing(out: str) -> Dict[str, str]:
+    """``path<TAB>size<TAB>mtime`` lines -> {path: "size/mtime"}; other lines are ignored."""
+    files = {}
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3 and parts[0]:
+            size, mtime = parts[1], parts[2].split(".")[0]
+            files[parts[0]] = f"{size}/{mtime}"
+    return files
+
+
+def _file_changes(before: Optional[Dict[str, str]], after: Optional[Dict[str, str]]) -> Optional[dict]:
+    """How /workspace differs going from ``before`` to ``after`` (None if either is unknown)."""
+    if before is None or after is None:
+        return None
+    back = sorted(set(after) - set(before))
+    gone = sorted(set(before) - set(after))
+    changed = sorted(p for p in set(before) & set(after) if before[p] != after[p])
+    out = {"root": DEFAULT_CWD}
+    for key, paths in (("appear", back), ("disappear", gone), ("change", changed)):
+        out[key] = paths[:_SUMMARY_LIMIT]
+        out[f"{key}_count"] = len(paths)
+    return out
+
+
+def describe_changes(changes: Optional[dict]) -> str:
+    """One readable line for a _file_changes dict."""
+    if changes is None:
+        return "Couldn't compare the file lists."
+    parts = []
+    for key, verb in (("appear", "come back"), ("disappear", "go away"), ("change", "change")):
+        count = changes.get(f"{key}_count", 0)
+        if count:
+            shown = ", ".join(changes[key])
+            more = f" and {count - len(changes[key])} more" if count > len(changes[key]) else ""
+            parts.append(f"{count} file(s) {verb} ({shown}{more})")
+    if not parts:
+        return f"No files under {changes.get('root', DEFAULT_CWD)} change."
+    return f"Under {changes.get('root', DEFAULT_CWD)}: " + "; ".join(parts) + "."
+
+
+def _ago(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 90:
+        return f"{seconds}s"
+    if seconds < 5400:
+        return f"{seconds // 60} min"
+    return f"{seconds / 3600:.1f} h"
 
 
 def _result(output: str, code: int, cwd: Optional[str] = None) -> dict:

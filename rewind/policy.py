@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import shlex
+from typing import Optional
 
 MODES = ("mutating", "always", "off")
 
@@ -111,6 +112,115 @@ def _words_mutate(words: list) -> bool:
     if program in _OUTPUT_FILE_ARG and len([a for a in args if not a.startswith("-")]) >= 2:
         return True
     return False
+
+
+# ------------------------------------------------------- irreversible commands
+# Snapshots cover the sandbox's files. These reach outside it, so no restore
+# can take them back. Matched per segment, on the program and its subcommand.
+_GIT_REMOTE = frozenset({"push", "send-email", "request-pull"})
+_PUBLISH = {
+    "npm": {"publish", "unpublish", "deprecate"}, "pnpm": {"publish"}, "yarn": {"publish", "npm"},
+    "cargo": {"publish", "yank"}, "gem": {"push", "yank"}, "twine": {"upload"},
+    "poetry": {"publish"}, "uv": {"publish"}, "docker": {"push", "login"}, "podman": {"push"},
+    "helm": {"install", "upgrade", "uninstall", "delete", "push"},
+    "terraform": {"apply", "destroy", "import"}, "tofu": {"apply", "destroy", "import"},
+    "pulumi": {"up", "destroy"}, "vercel": {"deploy", "--prod", "rm", "remove"},
+    "netlify": {"deploy"}, "flyctl": {"deploy", "destroy"}, "fly": {"deploy", "destroy"},
+    "heroku": set(), "aws": set(), "gcloud": set(), "az": set(), "doctl": set(),
+}
+_CLOUD_READ = ("describe", "get", "list", "ls", "show", "whoami", "help", "version", "info",
+               "logs", "status", "configure", "config", "auth")
+_KUBECTL_READ = frozenset({"get", "describe", "logs", "explain", "version", "config", "api-resources",
+                           "top", "auth", "diff", "cluster-info"})
+_GH_READ = frozenset({"view", "list", "status", "diff", "checks", "browse", "search", "download"})
+_REMOTE_COPY = frozenset({"scp", "rsync", "sftp"})
+_REMOTE_SHELL = frozenset({"ssh", "psql", "mysql", "mongosh", "mongo", "redis-cli", "sqlcmd"})
+_MAIL = frozenset({"sendmail", "mail", "mailx", "mutt", "msmtp"})
+_HTTP_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_CURL_DATA = ("-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "-F", "--form",
+              "-T", "--upload-file", "--json")
+
+
+def irreversible_reason(command: str) -> Optional[str]:
+    """Why ``command`` would change something outside the sandbox, or None.
+
+    Best effort, aimed at the common cases (git push, publishing, deploys,
+    HTTP writes, remote shells). A None here does not prove a command is safe.
+    """
+    if not command.strip():
+        return None
+    for segment in _SEPARATORS.split(_REDIRECT.sub(" ", command)):
+        segment = segment.strip().lstrip("({!").rstrip(")}").strip()
+        if not segment:
+            continue
+        try:
+            words = shlex.split(segment)
+        except ValueError:
+            words = segment.split()
+        reason = _words_irreversible(words)
+        if reason:
+            return reason
+    return None
+
+
+def _words_irreversible(words: list) -> Optional[str]:
+    while words and (_ASSIGNMENT.match(words[0]) or words[0] in _WRAPPERS or words[0] in ("sudo", "env")):
+        words = words[1:]
+    if not words:
+        return None
+    program = words[0].rsplit("/", 1)[-1]
+    args = words[1:]
+    positional = [a for a in args if not a.startswith("-")]
+    sub = positional[0] if positional else ""
+    if program == "git" and sub in _GIT_REMOTE:
+        return f"`git {sub}` sends commits outside the sandbox"
+    if program in _PUBLISH:
+        subs = _PUBLISH[program]
+        if not subs:  # cloud CLIs: anything but an obvious read
+            if not positional or any(p.startswith(_CLOUD_READ) for p in positional[1:] or positional):
+                return None
+            return f"`{program} {sub}` changes a cloud account outside the sandbox"
+        if sub in subs or any(a in subs for a in args):
+            what = f"{program} {sub}".strip()
+            return f"`{what}` changes a remote service"
+    if program == "kubectl" and sub and sub not in _KUBECTL_READ:
+        return f"`kubectl {sub}` changes a cluster outside the sandbox"
+    if program == "gh":
+        action = positional[1] if len(positional) > 1 else ""
+        if sub == "api" and any(a in ("-X", "--method", "-f", "-F", "--field", "--raw-field", "--input")
+                                for a in args):
+            return "`gh api` with a write changes GitHub"
+        if sub not in ("api", "auth", "help", "") and action and action not in _GH_READ:
+            return f"`gh {sub} {action}` changes GitHub"
+    if program in ("curl", "wget", "http", "https", "xh"):
+        method = _http_method(program, args)
+        if method in _HTTP_WRITE_METHODS:
+            return f"`{program}` sends an HTTP {method} request"
+    if program in _REMOTE_COPY and any(":" in a and not a.startswith("-") for a in positional):
+        return f"`{program}` copies files to or from another machine"
+    if program in _REMOTE_SHELL:
+        return f"`{program}` runs commands on another machine or database"
+    if program in _MAIL:
+        return f"`{program}` sends email"
+    return None
+
+
+def _http_method(program: str, args: list) -> Optional[str]:
+    for i, arg in enumerate(args):
+        if arg in ("-X", "--request", "--method") and i + 1 < len(args):
+            return args[i + 1].upper()
+        if arg.startswith("--request=") or arg.startswith("--method="):
+            return arg.partition("=")[2].upper()
+        if arg.startswith("-X") and len(arg) > 2:
+            return arg[2:].upper()
+    if program == "curl" and any(a in _CURL_DATA or a.startswith(tuple(f"{d}=" for d in _CURL_DATA))
+                                 for a in args):
+        return "POST"
+    if program == "wget" and any(a.startswith(("--post-data", "--post-file", "--body-data")) for a in args):
+        return "POST"
+    if program in ("http", "https", "xh") and args and args[0].upper() in _HTTP_WRITE_METHODS:
+        return args[0].upper()
+    return None
 
 
 def _env_mutates(args: list) -> bool:

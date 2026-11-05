@@ -31,6 +31,17 @@ def get(task_id: Optional[str] = None) -> Optional[Any]:
         return next(iter(live.values())) if len(live) == 1 else None
 
 
+def keys() -> list:
+    with _lock:
+        return list(_by_task)
+
+
+def repositories() -> list:
+    """Image repositories of the sandboxes in this process, which cleanup must not touch."""
+    with _lock:
+        return sorted({getattr(env, "repository", "") for env in _by_task.values()} - {""})
+
+
 def count() -> int:
     with _lock:
         return len({id(env) for env in _by_task.values()})
