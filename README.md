@@ -15,7 +15,7 @@ A prompt can ask the agent to "be careful". Rewind makes mistakes reversible. It
 ## Install
 
 ```bash
-hermes plugins install <your-github-user>/hermes-rewind --enable
+hermes plugins install viking770/hermes-rewind --enable
 hermes config set terminal.backend rewind
 ```
 
