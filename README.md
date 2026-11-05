@@ -35,12 +35,13 @@ Requires Docker (Docker Desktop on macOS/Windows, Docker Engine on Linux).
 | `/rewind restore ID` | Rolls back to a snapshot, e.g. `s3`. This is also how you undo an undo |
 | `/rewind preview ID` | Shows which files would come back or go away, without changing anything |
 | `/rewind changes` | Files added, changed or deleted since the sandbox started or was last restored |
-| `/rewind export PATH` | Copies a file or folder out of the sandbox onto your computer |
+| `/rewind export PATH` | Copies a file or folder out of the sandbox onto your computer (local chats only; plain files and folders only) |
+| `/rewind forget` | Deletes this chat's snapshots now, after asking (`/rewind forget yes`). The files stay as they are |
 | `/rewind status` | Plugin version, and the sandboxes Rewind is keeping |
 
 (`/undo`, `/rollback` and `/snapshot` are Hermes's own commands for conversation turns and checkpoints. They don't touch the Rewind sandbox.)
 
-On the command line, `hermes rewind status` shows the same status and `hermes rewind gc` deletes expired snapshots and leftovers now.
+On the command line, `hermes rewind status` shows the same status, `hermes rewind gc` deletes expired snapshots and leftovers now, and `hermes rewind purge` deletes every kept snapshot right away (`--exports` also deletes everything exported).
 
 ## Agent tools
 
@@ -51,7 +52,7 @@ On the command line, `hermes rewind status` shows the same status and `hermes re
 | `rewind_restore` | Rolls back to a snapshot id or `last`. With `preview: true` it only reports what would change |
 | `rewind_snapshot` | Saves a named checkpoint, e.g. "before refactor" |
 | `rewind_changes` | Shows files added, changed or deleted since the sandbox was created or last restored |
-| `rewind_export` | Copies a file or folder out of the sandbox onto the user's computer |
+| `rewind_export` | Copies a file or folder out of the sandbox onto the user's computer. Hermes asks the user first; local chats only |
 
 Hermes's tool search keeps plugin tools out of the default list, so models find these through tool search. Rewind also adds a short system-prompt section that tells the model they exist, that a snapshot is the state *before* its command, and to undo once rather than recreate files by hand.
 
@@ -77,7 +78,11 @@ The internet is still reachable in `internet` mode, so a misled agent can still 
 
 **Each chat only reaches its own sandbox.** From a messaging platform (Telegram, Discord, Slack and so on), `/rewind` acts only on that chat's own sandbox, `/rewind status` doesn't list other chats, and `/rewind export` is refused because it writes to the Hermes host's disk. The sandbox Hermes shares on purpose is reachable from local chats (CLI, TUI, desktop app) only.
 
-The "can't undo" prompt below is a reminder, not a security boundary: `bash -c 'git push'` or a Python script that makes a request isn't caught. The network mode is the real control.
+**Exports only bring plain files onto your computer.** The agent's `rewind_export` makes Hermes ask you first, and only works in local chats. The copy is streamed as a tar and unpacked by Rewind itself: symlinks (to a host path, say), hard links, devices and FIFOs are skipped and listed, nothing can land outside the export folder, setuid bits are dropped, and nothing is overwritten. Each export is capped by `REWIND_EXPORT_MAX_MB`, and all exports together by `REWIND_EXPORT_TOTAL_MB`.
+
+**Secrets in commands aren't kept.** Before Rewind stores a snapshot's command, it masks common secrets: `Authorization` and API-key headers, passwords in URLs, `curl -u`, `--password`/`--token` options, `NAME_TOKEN=…`-style variables, and well-known token formats (GitHub, GitLab, Slack, OpenAI/Anthropic, AWS, Google, Hugging Face, npm, JWTs, private keys). This is best effort, and the snapshots themselves still hold whatever files the agent created. Records are owner-only (`0600`) on Linux and macOS. `/rewind forget` and `hermes rewind purge` delete history immediately.
+
+The "can't undo" prompt is a reminder, not a security boundary. It sees through `bash -c '…'`, `eval`, `xargs`, `timeout`, `git -C dir push` and inline scripts that call `requests.post`, `fetch(… method: 'POST')`, `smtplib` and similar, but a determined script can always hide a request. Approving "always" covers one action (`git push`), not the whole program. The network mode is the real control.
 
 ### When the sandbox goes away
 Hermes shuts a sandbox down when its session ends **and** when it has been idle for `terminal.lifetime_seconds` (300 seconds by default), even if the chat is still open. Rewind can't tell those apart, so it keeps the undo history either way:
@@ -107,7 +112,9 @@ Snapshots only cover the sandbox's files. Before a command that reaches outside 
 | `REWIND_KEEP_HOURS` | `24` | How long snapshots are kept after the sandbox shuts down (`0` = delete right away) |
 | `REWIND_STATE_DIR` | `<HERMES_HOME>/rewind` | Where the records of parked sandboxes live |
 | `REWIND_EXPORT_DIR` | `<state dir>/exports` | Where `rewind_export` and `/rewind export` put copies |
-| `REWIND_EXPORT_MAX_MB` | `500` | Largest export allowed |
+| `REWIND_EXPORT_MAX_MB` | `500` | Largest single export allowed |
+| `REWIND_EXPORT_TOTAL_MB` | `2000` | Cap on everything in the export folder together |
+| `REWIND_CONFIRM_EXPORT` | `1` | Set to `0` to stop asking before the agent exports files |
 | `REWIND_CONFIRM_IRREVERSIBLE` | `1` | Set to `0` to stop asking before commands Rewind can't undo |
 | `REWIND_AUTO_GC` | `1` | Set to `0` to stop the automatic cleanup of expired snapshots and leftovers |
 
@@ -117,9 +124,9 @@ To give yourself longer before Hermes shuts an idle sandbox down, raise Hermes's
 - **Runs shell commands** inside a Docker container through the Docker Engine API (the same socket the `docker` CLI uses), or the `docker` CLI itself. Commands do not run on your host.
 - **Creates Docker images** (`hermes-rewind/<task>:sN`) for snapshots, labelled `hermes.rewind=1` with the id of the Hermes process that made them. They are kept for `REWIND_KEEP_HOURS` after the sandbox shuts down, then deleted. `/rewind` shows each snapshot's size. To delete everything by hand: `docker ps -aq --filter label=hermes.rewind=1 | xargs docker rm -f` and `docker images 'hermes-rewind/*' -q | xargs docker rmi -f`.
 - **Writes small JSON records** of parked sandboxes to `<HERMES_HOME>/rewind/sandboxes/`.
-- **Writes to your computer only when asked to export:** `rewind_export` copies into a new timestamped folder under `REWIND_EXPORT_DIR` and never overwrites anything. `/rewind export` works from local chats only.
+- **Writes to your computer only when you approve an export:** plain files and folders only, into a new timestamped folder under `REWIND_EXPORT_DIR`, never overwriting, within the size caps. Local chats only.
 - **Network:** by default the sandbox reaches the internet but not this computer or the LAN (see [Security](#security)). The first run pulls the base image from Docker Hub and builds the small firewall helper image. The plugin makes no other network calls and has no telemetry.
-- **Credentials:** Rewind reads none and passes none into the sandbox. Snapshots keep whatever the agent puts in the sandbox, and the records keep each snapshot's command text, for up to `REWIND_KEEP_HOURS` after the chat ends. If a command contains a token, that token is in the record.
+- **Credentials:** Rewind reads none and passes none into the sandbox. Snapshots keep whatever files the agent puts in the sandbox for up to `REWIND_KEEP_HOURS` after the chat ends; command text in records has common secrets masked. Delete it all sooner with `/rewind forget` or `hermes rewind purge`.
 
 ## Limits
 - Snapshots cover the container filesystem only. Running processes, and anything sent over the network (a `git push`, an API call), cannot be undone.

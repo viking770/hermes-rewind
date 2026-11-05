@@ -49,6 +49,18 @@ class DockerIntegrationTest(unittest.TestCase):
         exported = env.export("/workspace/app", Path(tempfile.mkdtemp()))
         self.assertEqual((exported / "data.txt").read_text().strip(), "important")
 
+        # A planted symlink (to a host path, or a folder) must not survive the copy out.
+        env.execute("mkdir -p /workspace/trap && echo ok > /workspace/trap/ok.txt && "
+                    "ln -s /etc/passwd /workspace/trap/link && ln -s 'C:\\Windows\\win.ini' /workspace/trap/win "
+                    "&& ln -s /workspace /workspace/trap/dir && mkfifo /workspace/trap/fifo")
+        exported = env.export("/workspace/trap", Path(tempfile.mkdtemp()))
+        self.assertEqual(sorted(p.name for p in exported.iterdir()), ["ok.txt"])
+        self.assertEqual(sorted(env.last_export_removed), ["trap/dir", "trap/fifo", "trap/link", "trap/win"])
+
+        # Secrets typed into a command are not kept in the snapshot list.
+        env.execute("git config --global url.'https://alice:hunter2@example.com/'.insteadOf x || true")
+        self.assertNotIn("hunter2", str(env.list_snapshots()))
+
     def test_hardened_and_firewalled(self):
         """H1 and H2 on a real daemon: no host or LAN access, internet and
         package installs still work, capabilities dropped, limits applied."""

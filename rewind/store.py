@@ -64,11 +64,17 @@ class Store:
 
     def save(self, record: dict) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
+        _owner_only(self.root, 0o700)
+        _owner_only(self.dir, 0o700)
         record = {**record, "format": FORMAT, "updated_at": time.time()}
         path = self.path(record["task_id"])
         tmp = path.with_suffix(f".{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(record, indent=1), encoding="utf-8")
+        # Created owner-only from the start, so it is never readable by others, even briefly.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(record, indent=1))
         os.replace(tmp, path)
+        _owner_only(path, 0o600)
 
     def delete(self, task_id: str) -> None:
         try:
@@ -83,6 +89,16 @@ class Store:
             record = _read(path)
             if record and record.get("task_id"):
                 yield record
+
+
+def _owner_only(path: Path, mode: int) -> None:
+    """chmod on POSIX. On Windows the folder under the user profile is already
+    private to the user, and chmod can't express ACLs anyway."""
+    if os.name != "nt":
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            pass
 
 
 def _read(path: Path) -> Optional[dict]:
@@ -143,6 +159,38 @@ def _pid_alive_windows(pid: int) -> bool:
         return code.value == still_active
     finally:
         kernel32.CloseHandle(handle)
+
+
+# ------------------------------------------------------------------ purging
+def purge(store: Store, run: Runner, *, docker_bin: str = "docker") -> Dict[str, int]:
+    """Delete every parked sandbox's snapshots and record now, without waiting for
+    them to expire. Sandboxes a live process is using are left alone."""
+    counts = {"purged": 0, "skipped_live": 0}
+    for record in list(store.records()):
+        if record.get("status") == "live" and record.get("host") in (None, hostname()) \
+                and pid_alive(record.get("owner_pid")):
+            counts["skipped_live"] += 1
+            continue
+        repo = record.get("repository", "")
+        images = set(record_images(record))
+        if repo.startswith("hermes-rewind/"):
+            try:
+                code, out = run([docker_bin, "images", repo, "--format", "{{.Repository}}:{{.Tag}}"], 60)
+            except Exception:
+                code, out = 1, ""
+            if code == 0:
+                images |= {i.strip() for i in out.splitlines() if i.strip().startswith(repo + ":")}
+        container = record.get("container") or ""
+        try:
+            if container.startswith("hermes-rewind-"):
+                run([docker_bin, "rm", "-f", container], 60)
+            if images:
+                run([docker_bin, "rmi", "-f", *sorted(images)], 300)
+        except Exception:
+            pass
+        store.delete(record["task_id"])
+        counts["purged"] += 1
+    return counts
 
 
 # ------------------------------------------------------------------ reaping

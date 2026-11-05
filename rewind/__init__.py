@@ -17,7 +17,9 @@ Optional settings (environment variables):
     REWIND_KEEP_HOURS     keep snapshots this long after the sandbox shuts down (default 24, 0 = delete)
     REWIND_STATE_DIR      where parked-sandbox records live (default <HERMES_HOME>/rewind)
     REWIND_EXPORT_DIR     where rewind_export copies files (default <state dir>/exports)
-    REWIND_EXPORT_MAX_MB  largest export allowed (default 500)
+    REWIND_EXPORT_MAX_MB  largest single export allowed (default 500)
+    REWIND_EXPORT_TOTAL_MB  cap on everything in the export folder (default 2000)
+    REWIND_CONFIRM_EXPORT set to 0 to stop asking before the agent exports files
     REWIND_CONFIRM_IRREVERSIBLE  set to 0 to stop asking before commands Rewind can't undo
     REWIND_AUTO_GC        set to 0 to stop the automatic cleanup of expired snapshots and leftovers
 """
@@ -112,6 +114,7 @@ class RewindProvider(TerminalEnvironmentProvider):
             keep_hours=keep,
             store=Store(settings.state_dir()) if keep > 0 else None,
             export_max_mb=settings.export_max_mb(),
+            export_total_mb=settings.export_total_mb(),
         )
         _maybe_gc()
         return env

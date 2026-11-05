@@ -147,9 +147,17 @@ def irreversible_reason(command: str) -> Optional[str]:
     Best effort, aimed at the common cases (git push, publishing, deploys,
     HTTP writes, remote shells). A None here does not prove a command is safe.
     """
-    if not command.strip():
+    return _irreversible(command, depth=0)
+
+
+def _irreversible(command: str, depth: int) -> Optional[str]:
+    if not command.strip() or depth > 3:
         return None
-    for segment in _SEPARATORS.split(_REDIRECT.sub(" ", command)):
+    # Inline scripts (python -c, heredocs, node -e) that send data somewhere.
+    match = _SCRIPT_SENDS.search(command)
+    if match:
+        return f"a script calls `{match.group(0).rstrip('(')}`, which sends data outside the sandbox"
+    for segment in _split_commands(_REDIRECT.sub(" ", command)):
         segment = segment.strip().lstrip("({!").rstrip(")}").strip()
         if not segment:
             continue
@@ -157,21 +165,98 @@ def irreversible_reason(command: str) -> Optional[str]:
             words = shlex.split(segment)
         except ValueError:
             words = segment.split()
-        reason = _words_irreversible(words)
+        reason = _words_irreversible(words, depth)
         if reason:
             return reason
     return None
 
 
-def _words_irreversible(words: list) -> Optional[str]:
+def _split_commands(command: str) -> list:
+    """Split on ; && || | & and newlines, but not inside quotes, so
+    `sh -c "cd app && git push"` stays one command whose script is checked."""
+    parts, current, quote, i = [], [], None, 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            current.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < len(command):
+                current.append(command[i + 1])
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+            current.append(ch)
+        elif ch == "\\" and i + 1 < len(command):
+            current += [ch, command[i + 1]]
+            i += 1
+        elif ch in ";|&\n":
+            parts.append("".join(current))
+            current = []
+            if command[i:i + 2] in ("&&", "||"):
+                i += 1
+        else:
+            current.append(ch)
+        i += 1
+    parts.append("".join(current))
+    return parts
+
+
+# Calls in inline Python/JS/Ruby that write to the network.
+_SCRIPT_SENDS = re.compile(
+    r"\b(?:requests|httpx|session|client)\.(?:post|put|patch|delete)\(|"
+    r"\burllib\.request\.(?:urlopen|Request)\([^)]*data\s*=|"
+    r"\bfetch\([^)]*method\s*:\s*['\"](?:POST|PUT|PATCH|DELETE)|"
+    r"\baxios\.(?:post|put|patch|delete)\(|"
+    r"\bsmtplib\.SMTP|\.sendmail\(|"
+    r"\bNet::HTTP\.post|"
+    r"\bparamiko\.SSHClient"
+)
+# Programs that run another command given as arguments: (program, options that take a value).
+_RUNNERS = {
+    "xargs": {"-I", "-n", "-P", "-L", "-d", "-a", "-E", "-s"}, "timeout": {"-s", "-k", "--signal", "--kill-after"},
+    "nice": {"-n", "--adjustment"}, "exec": set(), "watch": {"-n", "--interval", "-d"},
+    "stdbuf": {"-i", "-o", "-e"}, "unbuffer": set(), "doas": {"-u"}, "chroot": set(),
+}
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash", "fish"})
+# git options that come before the subcommand and take a value: git -C repo push.
+_GIT_VALUE_OPTS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"})
+
+
+def _git_subcommand(args: list) -> str:
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in _GIT_VALUE_OPTS:
+            i += 2
+        elif arg.startswith("-"):
+            i += 1
+        else:
+            return arg
+    return ""
+
+
+def _words_irreversible(words: list, depth: int = 0) -> Optional[str]:
     while words and (_ASSIGNMENT.match(words[0]) or words[0] in _WRAPPERS or words[0] in ("sudo", "env")):
         words = words[1:]
     if not words:
         return None
     program = words[0].rsplit("/", 1)[-1]
     args = words[1:]
+    # A command hidden inside another: bash -c '...', eval ..., xargs git push, timeout 5 curl ...
+    if program in _SHELLS and "-c" in args[:-1]:
+        return _irreversible(args[args.index("-c") + 1], depth + 1)
+    if program == "eval":
+        return _irreversible(" ".join(args), depth + 1)
+    if program in _RUNNERS:
+        value_opts, i = _RUNNERS[program], 0
+        while i < len(args) and args[i].startswith("-"):
+            i += 2 if args[i] in value_opts else 1
+        if program in ("timeout",) and i < len(args):
+            i += 1  # the duration
+        return _words_irreversible(args[i:], depth + 1) if i < len(args) else None
     positional = [a for a in args if not a.startswith("-")]
-    sub = positional[0] if positional else ""
+    sub = _git_subcommand(args) if program == "git" else (positional[0] if positional else "")
     if program == "git" and sub in _GIT_REMOTE:
         return f"`git {sub}` sends commits outside the sandbox"
     if program in _PUBLISH:

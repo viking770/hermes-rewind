@@ -1,9 +1,19 @@
 """Tests for the 0.2.1 security fixes: container hardening (H1) and the
 network guard (H2). Session isolation (H3) is tested with the tools."""
+import contextlib
+import io
+import json
+import os
+import stat
+import tarfile
+import tempfile
 import unittest
+from pathlib import Path
 
-from rewind import registry
+from rewind import policy, registry, store as store_mod, tools
 from rewind.docker_api import ApiRunner, _bytes
+from rewind.redact import MASK, redact
+from rewind.store import Store
 from rewind.environment import (
     GUARD_IMAGE, RewindEnvironment, RewindError, _BLOCKED_V4, _guard_script,
 )
@@ -151,6 +161,238 @@ class NetworkGuardTests(unittest.TestCase):
         self.assertLess(allow, script.index("-d 192.168.0.0/16 -j REJECT"))
         self.assertIn("ip6tables -A OUTPUT -d fc00::/7 -j REJECT", script)
         self.assertIn("REWIND_GUARD_OK", script)
+
+
+class ExportSafetyTests(unittest.TestCase):
+    """M1: the agent can't quietly write to this computer."""
+
+    def setUp(self):
+        registry.clear()
+        self.fake = FakeDocker()
+
+    def test_hook_asks_before_the_agent_exports(self):
+        result = tools.pre_tool_call(tool_name="rewind_export", args={"path": "/workspace/app"})
+        self.assertEqual(result["action"], "approve")
+        self.assertIn("/workspace/app", result["message"])
+        self.assertIn("this computer", result["message"])
+        self.assertEqual(result["rule_key"], "rewind-export")
+        # Also when the call comes through Hermes's tool-search bridge.
+        bridged = tools.pre_tool_call(tool_name="tool_call",
+                                      args={"name": "rewind_export", "arguments": {"path": "x"}})
+        self.assertEqual(bridged["action"], "approve")
+        os.environ["REWIND_CONFIRM_EXPORT"] = "0"
+        try:
+            self.assertIsNone(tools.pre_tool_call(tool_name="rewind_export", args={"path": "x"}))
+        finally:
+            del os.environ["REWIND_CONFIRM_EXPORT"]
+
+    def test_export_tool_refused_on_messaging_platforms(self):
+        env_for(self.fake, network="none")
+
+        class Ctx:
+            def session_surface(self):
+                return "telegram"
+
+        saved, tools._CTX = tools._CTX, Ctx()
+        try:
+            result = json.loads(tools.HANDLERS["rewind_export"]({"path": "app"}, task_id="sec"))
+        finally:
+            tools._CTX = saved
+        self.assertFalse(result["ok"])
+        self.assertIn("only available in local chats", result["error"])
+        self.assertNotIn("cp", self.fake.verbs())
+
+    def test_export_total_cap(self):
+        dest = Path(tempfile.mkdtemp())
+        (dest / "old.bin").write_bytes(b"x" * 3 * 1024 * 1024)  # 3 MB already exported
+        env = env_for(self.fake, network="none", export_total_mb=4)
+
+        class Du(FakeDocker):
+            def __call__(self, argv, timeout=None):
+                if argv[1] == "exec" and "du -sk" in argv[-1]:
+                    self.calls.append(list(argv))
+                    return 0, "2048\n"  # 2 MB more would pass the 4 MB cap
+                return super().__call__(argv, timeout)
+
+        env._run = Du()
+        with self.assertRaisesRegex(RewindError, "REWIND_EXPORT_TOTAL_MB"):
+            env.export("big", dest)
+
+    def test_only_plain_files_come_out_of_a_hostile_archive(self):
+        from rewind.environment import _extract_plain
+        archive = hostile_tar()
+        dest = Path(tempfile.mkdtemp())
+        outside = dest.parent / f"{dest.name}-outside"
+        removed = _extract_plain(archive, dest)
+        self.assertEqual((dest / "app" / "ok.txt").read_text(), "fine")
+        self.assertEqual((dest / "app" / ".env").read_text(), "dotfile kept")  # leading dot survives
+        self.assertTrue((dest / "app" / "sub").is_dir())
+        for name in ("app/trap", "app/hard", "app/fifo", "app/dev", "../escape.txt", "abs/evil.txt"):
+            self.assertIn(name, removed)
+        self.assertFalse((dest / "app" / "trap").exists())
+        self.assertFalse((dest.parent / "escape.txt").exists())
+        self.assertFalse(outside.exists())
+        mode = stat.S_IMODE(os.stat(dest / "app" / "setuid").st_mode)
+        self.assertFalse(mode & (stat.S_ISUID | stat.S_ISGID))
+
+    def test_extraction_never_overwrites_and_respects_the_cap(self):
+        from rewind.environment import _extract_plain
+        dest = Path(tempfile.mkdtemp())
+        _extract_plain(hostile_tar(), dest)
+        self.assertIn("app/ok.txt", _extract_plain(hostile_tar(), dest))  # exists already: skipped
+        with self.assertRaisesRegex(RewindError, "limit"):
+            _extract_plain(hostile_tar(big=2 * 1024 * 1024), Path(tempfile.mkdtemp()), max_mb=1)
+
+    def test_export_streams_through_the_safe_extractor(self):
+        env = env_for(self.fake, network="none")
+        seen = []
+        env._tar_reader = fake_tar_reader(seen)
+        dest_root = Path(tempfile.mkdtemp())
+        copied = env.export("app", dest_root)
+        self.assertEqual(seen[0][1:], ["cp", f"{env.container}:/workspace/app", "-"])
+        self.assertEqual((copied / "ok.txt").read_text(), "fine")
+        self.assertIn("app/trap", env.last_export_removed)
+
+
+def hostile_tar(big: int = 0) -> io.BytesIO:
+    """A tar with plain files plus everything an export must not create."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        def add(name, kind=tarfile.REGTYPE, data=b"", **kw):
+            info = tarfile.TarInfo(name)
+            info.type = kind
+            info.size = len(data)
+            for key, value in kw.items():
+                setattr(info, key, value)
+            tar.addfile(info, io.BytesIO(data) if data else None)
+
+        add("app", tarfile.DIRTYPE)
+        add("app/ok.txt", data=b"fine")
+        add("app/.env", data=b"dotfile kept")
+        add("app/sub", tarfile.DIRTYPE)
+        add("app/setuid", data=b"x", mode=0o4755)
+        add("app/trap", tarfile.SYMTYPE, linkname="/etc/passwd")
+        add("app/hard", tarfile.LNKTYPE, linkname="app/ok.txt")
+        add("app/fifo", tarfile.FIFOTYPE)
+        add("app/dev", tarfile.CHRTYPE)
+        add("../escape.txt", data=b"escaped")
+        add("/abs/evil.txt", data=b"absolute")
+        if big:
+            add("app/big.bin", data=b"x" * big)
+    buf.seek(0)
+    return buf
+
+
+def fake_tar_reader(seen):
+    @contextlib.contextmanager
+    def reader(argv):
+        seen.append(list(argv))
+        yield hostile_tar()
+    return reader
+
+
+class SecretRetentionTests(unittest.TestCase):
+    """M2: secrets in commands don't end up in records, and history can be deleted."""
+
+    def test_redaction(self):
+        cases = {
+            'curl -H "Authorization: Bearer abc.def.ghi" https://x': "abc.def.ghi",
+            "git clone https://alice:hunter2@github.com/a/b": "hunter2",
+            "curl -u bob:s3cret https://x": "s3cret",
+            "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123 gh pr list": "ghp_abcdefghijklmnopqrstuvwxyz0123",
+            "export OPENAI_API_KEY='sk-proj-abcdefghijklmnopqrstuvwx'": "sk-proj-abcdefghijklmnopqrstuvwx",
+            "aws configure set aws_secret_access_key x AKIAABCDEFGHIJKLMNOP": "AKIAABCDEFGHIJKLMNOP",
+            "psql --password hunter2 db": "hunter2",
+            "mysql -u root -pHunter2 db": "Hunter2",
+            "npm config set //registry/:_authToken=npm_abcdefghijklmnopqrstuvwxyz0123456789": "npm_abcdefghij",
+        }
+        for command, secret in cases.items():
+            cleaned = redact(command)
+            self.assertNotIn(secret, cleaned, command)
+            self.assertIn(MASK, cleaned, command)
+        for safe in ("ls -la", "git push origin main", "pip install requests", "echo password reset done"):
+            self.assertEqual(redact(safe), safe)
+
+    def test_snapshot_records_keep_the_redacted_command(self):
+        registry.clear()
+        store = Store(Path(tempfile.mkdtemp()))
+        env = env_for(FakeDocker(), network="none", keep_hours=1, store=store)
+        env.execute("git clone https://alice:hunter2@github.com/a/b")
+        self.assertNotIn("hunter2", env.snapshots[0].command)
+        self.assertNotIn("hunter2", json.dumps(env.list_snapshots()))
+        self.assertNotIn("hunter2", store.path("sec").read_text(encoding="utf-8"))
+
+    @unittest.skipIf(os.name == "nt", "POSIX permissions")
+    def test_records_are_owner_only(self):
+        store = Store(Path(tempfile.mkdtemp()))
+        store.save({"task_id": "t", "status": "parked"})
+        self.assertEqual(stat.S_IMODE(os.stat(store.path("t")).st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.stat(store.dir).st_mode), 0o700)
+
+    def test_forget_deletes_this_chats_snapshots(self):
+        registry.clear()
+        fake = FakeDocker()
+        env = RewindEnvironment(task_id="session:chat-f", runner=fake, background=False, network="none")
+        env.execute("rm a")
+        env.execute("rm b")
+        images = [s.image for s in env.snapshots]
+        ask = tools.slash_rewind("forget", session_key="chat-f")
+        self.assertIn("Run /rewind forget yes", ask)
+        self.assertEqual(len(env.snapshots), 2)  # nothing deleted without "yes"
+        done = tools.slash_rewind("forget yes", session_key="chat-f")
+        self.assertIn("Deleted 2 snapshot(s)", done)
+        self.assertEqual(env.snapshots, [])
+        rmi = [c for c in fake.calls if c[1] == "rmi"][-1]
+        self.assertEqual(sorted(rmi[3:]), sorted(images))
+        env.execute("rm c")  # snapshots continue
+        self.assertEqual(len(env.snapshots), 1)
+
+    def test_purge_deletes_parked_but_not_live(self):
+        store = Store(Path(tempfile.mkdtemp()))
+        store.save({"task_id": "parked", "status": "parked", "repository": "hermes-rewind/p-1",
+                    "image": "hermes-rewind/p-1:s2", "snapshots": [{"image": "hermes-rewind/p-1:s1"}]})
+        store.save({"task_id": "live", "status": "live", "repository": "hermes-rewind/l-1",
+                    "owner_pid": os.getpid(), "host": store_mod.hostname(), "container": "hermes-rewind-l-1"})
+        fake = FakeDocker()
+        counts = store_mod.purge(store, fake)
+        self.assertEqual(counts, {"purged": 1, "skipped_live": 1})
+        self.assertIsNone(store.load("parked"))
+        self.assertIsNotNone(store.load("live"))
+        rmi = next(c for c in fake.calls if c[1] == "rmi")
+        self.assertIn("hermes-rewind/p-1:s1", rmi)
+        self.assertNotIn("rm", [c[1] for c in fake.calls if "hermes-rewind-l-1" in c])
+
+
+class WrappedCommandTests(unittest.TestCase):
+    """M3: the obvious ways around the "can't undo" prompt are caught."""
+
+    def test_wrapped_and_scripted_writes_are_caught(self):
+        for command in [
+            "bash -c 'git push origin main'", "sh -c \"cd app && git push\"", "eval git push",
+            "git -C repo push", "git -c user.name=x push", "timeout 30 git push", "xargs -n1 git push",
+            "nice -n 5 npm publish", "python3 -c \"import requests; requests.post('https://x', data=d)\"",
+            "node -e \"fetch('https://x', {method: 'POST', body: b})\"",
+            "python3 - <<'EOF'\nimport httpx\nhttpx.put('https://x')\nEOF",
+            "python3 -c 'import smtplib; smtplib.SMTP(\"mail\")'",
+        ]:
+            self.assertIsNotNone(policy.irreversible_reason(command), command)
+
+    def test_reads_stay_unflagged(self):
+        for command in [
+            "bash -c 'ls -la'", "git -C repo status", "timeout 5 curl https://x",
+            "python3 -c \"import requests; print(requests.get('https://x').status_code)\"",
+            "xargs -n1 echo", "eval echo hi",
+        ]:
+            self.assertIsNone(policy.irreversible_reason(command), command)
+
+    def test_approval_is_per_action_not_per_program(self):
+        from rewind.tools import _rule_key
+        self.assertEqual(_rule_key(policy.irreversible_reason("git push")), "rewind-irreversible-git-push")
+        self.assertEqual(_rule_key(policy.irreversible_reason("git send-email x")),
+                         "rewind-irreversible-git-send-email")
+        self.assertEqual(_rule_key(policy.irreversible_reason("npm publish")), "rewind-irreversible-npm-publish")
+        self.assertNotEqual(_rule_key(policy.irreversible_reason("docker push a")),
+                            _rule_key(policy.irreversible_reason("docker login")))
 
 
 if __name__ == "__main__":

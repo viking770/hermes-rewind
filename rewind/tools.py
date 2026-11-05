@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shlex
 import shutil
 import subprocess
@@ -205,8 +206,30 @@ def rewind_export(args, **kwargs):
     path = str(args.get("path", "")).strip()
     if not path:
         raise RewindError("Pass the path of a file or folder in the sandbox.")
-    copied = _env(kwargs).export(path, settings.export_dir())
-    return _ok(host_path=str(copied), message=f"Copied {path} to {copied} on the user's computer.")
+    surface = _surface()
+    if not is_local(surface):
+        raise RewindError(
+            f"rewind_export writes to the Hermes host's disk, so it is only available in local chats "
+            f"(this one is on {surface}). Show the user the file contents instead."
+        )
+    env = _env(kwargs)
+    copied = env.export(path, settings.export_dir())
+    removed = env.last_export_removed
+    note = (f" Removed {len(removed)} symlink(s) or special file(s) that could point elsewhere on "
+            f"this computer: {', '.join(removed[:10])}." if removed else "")
+    return _ok(host_path=str(copied), removed=removed,
+               message=f"Copied {path} to {copied} on the user's computer.{note}")
+
+
+# The plugin context, for asking which surface (CLI, Telegram, ...) a call comes from.
+_CTX = None
+
+
+def _surface() -> str:
+    try:
+        return str(_CTX.session_surface() or "") if _CTX is not None else ""
+    except Exception:
+        return ""
 
 
 HANDLERS = {
@@ -230,7 +253,8 @@ SLASH_HELP = (
     "/rewind restore ID   roll back to snapshot ID (e.g. s3)\n"
     "/rewind preview ID   show what restoring ID would change\n"
     "/rewind changes      files changed since the last restore\n"
-    "/rewind export PATH  copy PATH out of the sandbox to this computer\n"
+    "/rewind export PATH  copy PATH out of the sandbox to this computer (local chats)\n"
+    "/rewind forget       delete this chat's snapshots now (asks first)\n"
     "/rewind status       plugin version and sandbox state"
 )
 
@@ -330,13 +354,23 @@ def slash_rewind(raw_args: str = "", session_key=None, session_id=None, platform
         if sub == "preview":
             target, changes = env.preview(rest[0] if rest else "last")
             return f"Restoring {target.id} ({target.state()}) would change:\n{describe_changes(changes)}"
+        if sub == "forget":
+            if [w.lower() for w in rest] != ["yes"]:
+                return (f"This deletes all {len(env.snapshots)} snapshot(s) of this chat's sandbox now, so "
+                        "nothing before this point can be undone. The files as they are now stay.\n"
+                        "Run /rewind forget yes to go ahead.")
+            return f"Deleted {env.forget()} snapshot(s). New changes are snapshotted as usual from here."
         if sub == "changes":
             changes = env.changes()
             return "\n".join(changes) if changes else "No changes since the sandbox started or was restored."
         if sub == "export":
             if not rest:
                 return "Usage: /rewind export PATH (a file or folder in the sandbox)."
-            return f"Copied to {env.export(rest[0], settings.export_dir())}"
+            copied = env.export(rest[0], settings.export_dir())
+            removed = env.last_export_removed
+            return f"Copied to {copied}" + (
+                f"\nRemoved {len(removed)} symlink(s) or special file(s): {', '.join(removed[:10])}"
+                if removed else "")
         return f"Unknown /rewind command {sub!r}.\n\n{SLASH_HELP}"
     except (RewindError, subprocess.TimeoutExpired, OSError) as exc:
         return f"Rewind: {exc}"
@@ -374,16 +408,37 @@ def run_gc() -> dict:
                           live_repositories=registry.repositories())
 
 
+def run_purge(exports: bool = False) -> dict:
+    """Delete every parked sandbox now (and, with ``exports``, the export folder)."""
+    counts = store_mod.purge(store_mod.Store(settings.state_dir()), subprocess_runner)
+    if exports:
+        folder = settings.export_dir()
+        counts["exports_deleted"] = int(folder.is_dir())
+        shutil.rmtree(folder, ignore_errors=True)
+    return counts
+
+
 def _cli_setup(parser) -> None:
     sub = parser.add_subparsers(dest="rewind_command")
     sub.add_parser("status", help="Show the plugin version and recorded sandboxes")
     sub.add_parser("gc", help="Delete expired snapshots and leftovers from crashed sessions")
+    purge = sub.add_parser("purge", help="Delete all kept snapshots now, without waiting for them to expire")
+    purge.add_argument("--exports", action="store_true", help="also delete everything exported to this computer")
 
 
 def _cli_handler(args) -> int:
-    if getattr(args, "rewind_command", None) == "gc":
+    command = getattr(args, "rewind_command", None)
+    if command == "gc":
         counts = run_gc()
         print("Rewind cleanup: " + ", ".join(f"{v} {k}" for k, v in counts.items()))
+    elif command == "purge":
+        counts = run_purge(exports=getattr(args, "exports", False))
+        print(f"Deleted {counts['purged']} kept sandbox(es) and their snapshots.")
+        if counts["skipped_live"]:
+            print(f"Left {counts['skipped_live']} that a running Hermes is using; run again after closing it.")
+        if "exports_deleted" in counts:
+            print(f"Deleted the export folder {settings.export_dir()}." if counts["exports_deleted"]
+                  else "There was no export folder.")
     else:
         print(_status_text())
     return 0
@@ -391,8 +446,23 @@ def _cli_handler(args) -> int:
 
 # --------------------------------------------------------------- hooks
 def pre_tool_call(tool_name: str = "", args=None, task_id=None, **_ignored):
-    """Ask the user before a terminal command whose effects Rewind can't undo."""
-    if tool_name != "terminal" or not isinstance(args, dict):
+    """Ask the user before the agent copies files onto this computer, and before
+    a terminal command whose effects Rewind can't undo."""
+    if not isinstance(args, dict):
+        return None
+    if tool_name == "tool_call" and isinstance(args.get("arguments"), dict):
+        tool_name, args = str(args.get("name", "")), args["arguments"]  # tool-search bridge
+    if tool_name == "rewind_export":
+        if not settings.confirm_export():
+            return None
+        path = str(args.get("path", "?"))[:200]
+        return {
+            "action": "approve",
+            "message": (f"The agent wants to copy {path!r} out of the Rewind sandbox onto this computer "
+                        f"(into {settings.export_dir()}). Allow it?"),
+            "rule_key": "rewind-export",
+        }
+    if tool_name != "terminal":
         return None
     if not settings.confirm_irreversible() or not settings.network_enabled() or not settings.backend_active():
         return None
@@ -402,22 +472,31 @@ def pre_tool_call(tool_name: str = "", args=None, task_id=None, **_ignored):
     reason = policy.irreversible_reason(command)
     if not reason:
         return None
-    program = reason.split("`")[1].split()[0] if "`" in reason else "command"
     return {
         "action": "approve",
         "message": f"Rewind can't undo this: {reason}. Snapshots only cover the sandbox's files. Run it?",
-        "rule_key": f"rewind-irreversible-{program}",
+        "rule_key": _rule_key(reason),
     }
 
 
+def _rule_key(reason: str) -> str:
+    """Approval key per action ("git push", "npm publish"), not per program, so
+    allowing one kind of push doesn't silently allow every git or npm write."""
+    quoted = reason.split("`")[1] if reason.count("`") >= 2 else "command"
+    words = [w for w in quoted.split() if re.fullmatch(r"[A-Za-z0-9._-]+", w)][:2] or ["command"]
+    return "rewind-irreversible-" + "-".join(words).lower()
+
+
 def register(ctx) -> None:
+    global _CTX
+    _CTX = ctx
     for name, schema in SCHEMAS.items():
         ctx.register_tool(name, TOOLSET, schema, HANDLERS[name], check_fn=docker_available)
     # The rest is optional: older Hermes versions or test doubles may lack it.
     for method, call in (
         ("register_command", lambda: ctx.register_command(
             "rewind", slash_rewind, description="Undo or inspect the Rewind sandbox without the model",
-            args_hint="[undo|restore ID|preview ID|changes|export PATH|status]")),
+            args_hint="[undo|restore ID|preview ID|changes|export PATH|forget|status]")),
         ("register_hook", lambda: ctx.register_hook("pre_tool_call", pre_tool_call)),
         ("register_system_prompt_section", lambda: ctx.register_system_prompt_section(
             "rewind.undo", PROMPT_SECTION)),

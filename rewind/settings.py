@@ -6,7 +6,7 @@ from pathlib import Path
 
 from . import store as store_mod
 from .environment import (
-    DEFAULT_CPUS, DEFAULT_EXPORT_MAX_MB, DEFAULT_KEEP_HOURS, DEFAULT_MEMORY_MB, DEFAULT_PIDS_LIMIT,
+    DEFAULT_CPUS, DEFAULT_EXPORT_MAX_MB, DEFAULT_EXPORT_TOTAL_MB, DEFAULT_KEEP_HOURS, DEFAULT_MEMORY_MB, DEFAULT_PIDS_LIMIT,
     NETWORK_MODES,
 )
 
@@ -47,6 +47,16 @@ def export_dir() -> Path:
 
 def export_max_mb() -> int:
     return int(max(0, _float("REWIND_EXPORT_MAX_MB", DEFAULT_EXPORT_MAX_MB)))
+
+
+def export_total_mb() -> int:
+    """Cap on everything in the export folder (REWIND_EXPORT_TOTAL_MB, 0 = no cap)."""
+    return int(max(0, _float("REWIND_EXPORT_TOTAL_MB", DEFAULT_EXPORT_TOTAL_MB)))
+
+
+def confirm_export() -> bool:
+    """Ask the user before the agent copies files onto this computer (REWIND_CONFIRM_EXPORT)."""
+    return os.environ.get("REWIND_CONFIRM_EXPORT", "1") != "0"
 
 
 def confirm_irreversible() -> bool:

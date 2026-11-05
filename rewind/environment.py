@@ -9,11 +9,14 @@ plugin has no Python dependencies.
 from __future__ import annotations
 
 import base64
+import contextlib
 import os
 import posixpath
 import re
 import shlex
+import shutil
 import subprocess
+import tarfile
 import tempfile
 import threading
 import time
@@ -24,6 +27,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import policy, registry, store as store_mod
 from .docker_api import ApiRunner
+from .redact import redact
 from .store import Store
 
 DEFAULT_IMAGE = "python:3.12-slim"
@@ -32,6 +36,7 @@ DEFAULT_MAX_SNAPSHOTS = 25
 DEFAULT_COMPACT_MB = 256
 DEFAULT_KEEP_HOURS = 24
 DEFAULT_EXPORT_MAX_MB = 500
+DEFAULT_EXPORT_TOTAL_MB = 2000
 # Lists files under /workspace as "path<TAB>size<TAB>mtime" for restore summaries.
 _LIST_FILES = (
     f"cd {DEFAULT_CWD} 2>/dev/null && find . -xdev \\( -type f -o -type l \\) "
@@ -184,6 +189,7 @@ class RewindEnvironment:
         keep_hours: float = 0,
         store: Optional[Store] = None,
         export_max_mb: int = DEFAULT_EXPORT_MAX_MB,
+        export_total_mb: int = DEFAULT_EXPORT_TOTAL_MB,
         cpus: Optional[float] = DEFAULT_CPUS,
         memory_mb: Optional[int] = DEFAULT_MEMORY_MB,
         pids_limit: Optional[int] = DEFAULT_PIDS_LIMIT,
@@ -247,6 +253,9 @@ class RewindEnvironment:
         self.keep_seconds = max(0.0, float(keep_hours)) * 3600
         self._store = store
         self.export_max_mb = export_max_mb
+        self.export_total_mb = export_total_mb
+        self.last_export_removed: List[str] = []
+        self._tar_reader = _popen_tar_reader  # tests swap in a fake
         self._note = ""  # said once, with the next command's output
         self.last_restore_changes: Optional[dict] = None
         if store is not None:
@@ -568,9 +577,10 @@ class RewindEnvironment:
             pending = self._commit()
         else:
             pending, self._pending = self._pending, None
+        # Secrets typed into a command must not end up in records that outlive the chat.
         snap = Snapshot(
-            pending.id, pending.image, label, command, pending.cwd, pending.created_at, auto, restore_point,
-            pending.parent,
+            pending.id, pending.image, redact(label), redact(command), pending.cwd, pending.created_at, auto,
+            restore_point, pending.parent,
         )
         if fresh:
             if compact:
@@ -721,6 +731,27 @@ class RewindEnvironment:
             self._start_background()  # ready for the first change after the restore
             return target, safety
 
+    def forget(self) -> int:
+        """Delete every snapshot of this sandbox now (the current state stays).
+        Returns how many were deleted. Undo history is gone afterwards."""
+        with self._lock:
+            self._finish_background()
+            images = [s.image for s in self.snapshots] + self._dropped_images
+            if self._pending is not None:
+                images.append(self._pending.image)
+                self._pending = None
+            count = len(self.snapshots)
+            in_use = self._image if self._image in images else None  # the running container's image
+            doomed = [i for i in images if i != in_use]
+            if doomed:
+                self._docker("rmi", "-f", *doomed, timeout=120, check=False)
+            self.snapshots.clear()
+            self._dropped_images = [in_use] if in_use else []  # deleted with the container later
+            self._persist()
+            if self._started:
+                self._start_background()
+            return count
+
     def undo(self) -> Tuple[Snapshot, Snapshot]:
         """Undo the most recent change: restore("last")."""
         return self.restore("last")
@@ -776,6 +807,13 @@ class RewindEnvironment:
                     f"{src} is {size_kb // 1024} MB, over the {self.export_max_mb} MB export limit "
                     "(REWIND_EXPORT_MAX_MB)."
                 )
+            # A cap on everything exported, so repeated exports can't fill the disk.
+            used_kb = _tree_bytes(Path(dest_root)) // 1024
+            if self.export_total_mb and used_kb + size_kb > self.export_total_mb * 1024:
+                raise RewindError(
+                    f"Exports already use {used_kb // 1024} MB of the {self.export_total_mb} MB allowed "
+                    f"(REWIND_EXPORT_TOTAL_MB) in {dest_root}. Delete old exports there first."
+                )
             slug = _SLUG.sub("-", self.task_id.lower()).strip("-")[-40:] or "task"
             dest = Path(dest_root) / slug / time.strftime("%Y%m%d-%H%M%S")
             n = 1
@@ -783,7 +821,17 @@ class RewindEnvironment:
                 n += 1
                 dest = dest.with_name(f"{dest.name.split('_')[0]}_{n}")
             dest.mkdir(parents=True)
-            self._docker("cp", f"{self.container}:{src}", str(dest), timeout=600)
+            # Stream it as a tar and unpack only plain files and folders. A symlink
+            # (to a host path, say), device or fifo is never created on this
+            # computer, and no entry may land outside `dest`. Letting `docker cp`
+            # unpack it instead would recreate links, and on Windows it fails
+            # outright on the first one.
+            argv = [self.docker_bin, "cp", f"{self.container}:{src}", "-"]
+            try:
+                with self._tar_reader(argv) as stream:
+                    self.last_export_removed = _extract_plain(stream, dest, self.export_max_mb)
+            except (tarfile.TarError, OSError) as exc:
+                raise RewindError(f"Couldn't copy {src} out of the sandbox: {exc}") from exc
             name = posixpath.basename(src.rstrip("/")) or "root"
             return dest / name
 
@@ -833,6 +881,77 @@ def _merge_diff(changes: Dict[str, str], diff: str) -> None:
             changes[path] = "C"  # deleted, then recreated
         else:
             changes[path] = kind
+
+
+def _tree_bytes(root: Path) -> int:
+    """Total size of the regular files under ``root`` (0 if it doesn't exist)."""
+    total = 0
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+@contextlib.contextmanager
+def _popen_tar_reader(argv: Sequence[str]):
+    """`docker cp container:path -` as a byte stream (a tar archive)."""
+    proc = subprocess.Popen(list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        yield proc.stdout
+        _, err = proc.communicate(timeout=600)
+        if proc.returncode:
+            raise RewindError(f"docker cp failed (exit {proc.returncode}): {_decode(err).strip()[-300:]}")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def _extract_plain(stream, dest: Path, max_mb: int = 0) -> List[str]:
+    """Unpack a tar stream into ``dest``, writing only regular files and folders.
+
+    Skips (and returns, as paths) links, devices, fifos, entries whose path is
+    absolute or climbs out with "..", and names this system can't store.
+    Files are written without setuid/setgid bits. ``max_mb`` caps the total
+    written, whatever the archive claims.
+    """
+    root = Path(dest).resolve()
+    removed, written, cap = [], 0, max_mb * 1024 * 1024 if max_mb else 0
+    with tarfile.open(fileobj=stream, mode="r|") as archive:
+        for member in archive:
+            raw = member.name.replace("\\", "/")
+            parts = [p for p in raw.split("/") if p not in ("", ".")]
+            if not parts:
+                continue
+            shown = "/".join(parts)
+            if raw.startswith("/") or ".." in parts or ":" in parts[0]:  # absolute, climbing, or C:...
+                removed.append(shown)
+                continue
+            target = root.joinpath(*parts)
+            resolved = target.resolve()
+            if resolved != root and root not in resolved.parents:
+                removed.append(shown)
+                continue
+            try:
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                elif member.isfile():
+                    if cap and written + member.size > cap:
+                        raise RewindError(f"The export is bigger than the {max_mb} MB limit.")
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    source = archive.extractfile(member)
+                    with open(target, "xb") as out:  # never overwrite
+                        shutil.copyfileobj(source, out)
+                    os.chmod(target, member.mode & 0o755 | 0o600)
+                    written += member.size
+                else:
+                    removed.append(shown)  # symlink, hard link, device, fifo
+            except (OSError, ValueError):
+                removed.append(shown)  # e.g. a name Windows can't store ("a:b", "con")
+    return removed
 
 
 def _parse_listing(out: str) -> Dict[str, str]:

@@ -280,15 +280,17 @@ class ExportAndSizeTests(unittest.TestCase):
         self.fake = FilesDocker()
 
     def test_export_copies_into_a_new_folder(self):
+        from .test_security import fake_tar_reader
         env = make_env(self.fake)
+        seen = []
+        env._tar_reader = fake_tar_reader(seen)
         dest_root = Path(tempfile.mkdtemp())
         first = env.export("app", dest_root)
         second = env.export("/workspace/app", dest_root)
         self.assertNotEqual(first.parent, second.parent)
         self.assertEqual(first.name, "app")
-        cp = [c for c in self.fake.calls if c[1] == "cp"]
-        self.assertEqual(cp[0][2], f"{env.container}:/workspace/app")
-        self.assertEqual(Path(cp[0][3]), first.parent)
+        self.assertEqual(seen[0][2], f"{env.container}:/workspace/app")
+        self.assertTrue((first / "ok.txt").is_file())
 
     def test_export_refuses_missing_and_too_big(self):
         env = make_env(self.fake, export_max_mb=1)
@@ -344,7 +346,7 @@ class IrreversibleTests(unittest.TestCase):
         result = hook(tool_name="terminal", args={"command": "git push origin main"}, task_id="t")
         self.assertEqual(result["action"], "approve")
         self.assertIn("can't undo", result["message"])
-        self.assertEqual(result["rule_key"], "rewind-irreversible-git")
+        self.assertEqual(result["rule_key"], "rewind-irreversible-git-push")
         self.assertIsNone(hook(tool_name="terminal", args={"command": "ls"}))
         self.assertIsNone(hook(tool_name="read_file", args={"command": "git push"}))
         os.environ["REWIND_CONFIRM_IRREVERSIBLE"] = "0"
@@ -415,7 +417,8 @@ class UndoToolAndSlashTests(unittest.TestCase):
         self.assertEqual(result["files"]["appear"], ["demo/hello.txt"])
 
     def test_export_tool(self):
-        make_env(self.fake)
+        from .test_security import fake_tar_reader
+        make_env(self.fake)._tar_reader = fake_tar_reader([])
         os.environ["REWIND_EXPORT_DIR"] = tempfile.mkdtemp()
         try:
             result = json.loads(tools.HANDLERS["rewind_export"]({"path": "app"}, task_id="demo"))
@@ -423,6 +426,8 @@ class UndoToolAndSlashTests(unittest.TestCase):
             del os.environ["REWIND_EXPORT_DIR"]
         self.assertTrue(result["ok"], result)
         self.assertTrue(result["host_path"].endswith("app"))
+        self.assertIn("app/trap", result["removed"])
+        self.assertIn("symlink", result["message"])
         self.assertFalse(json.loads(tools.HANDLERS["rewind_export"]({}, task_id="demo"))["ok"])
 
     def test_slash_command(self):

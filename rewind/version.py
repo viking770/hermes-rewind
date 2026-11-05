@@ -11,7 +11,7 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 
 _DIR = Path(__file__).resolve().parent
 _VERSION_LINE = re.compile(r"^version:\s*[\"']?([^\"'\s#]+)", re.MULTILINE)
