@@ -45,6 +45,9 @@ class RewindProvider(TerminalEnvironmentProvider):
     display_name = "Rewind"
     is_remote = False
     is_container = True
+    # Rewind's sandboxes are thrown away when the session ends, so with
+    # `terminal.container_persistent: false` each session gets its own.
+    session_isolated_when_nonpersistent = True
 
     @property
     def description(self) -> str:

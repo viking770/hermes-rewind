@@ -9,7 +9,7 @@ import abc
 class TerminalEnvironmentProvider(abc.ABC):
     is_remote = True
     is_container = True
-    session_isolated_when_nonpersistent = False
+    session_isolated_when_nonpersistent = False  # Hermes's default; RewindProvider opts in
     supports_streams = False
 
     @abc.abstractmethod

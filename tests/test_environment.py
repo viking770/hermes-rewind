@@ -62,7 +62,8 @@ class EnvironmentTests(unittest.TestCase):
         env = make_env(self.fake)
         self.assertEqual(self.fake.calls, [])
         result = env.execute("ls")
-        self.assertEqual(result, {"output": "hello\n", "exit_code": 0})
+        self.assertEqual(result, {"output": "hello\n", "returncode": 0, "exit_code": 0,
+                                  "cwd": "/workspace", "cwd_observed": True})
         self.assertEqual(self.fake.verbs(), ["run", "exec", "exec"])
         self.assertNotIn("commit", self.fake.verbs())
         # Uses bash once detected, and names are docker-safe.
@@ -86,6 +87,39 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(env.cwd, "/workspace/src")
         env.execute("ls")
         self.assertIn("cd /workspace/src", self.fake.calls[-1][-1])
+
+    def test_hermes_result_contract(self):
+        # Hermes reads result["returncode"] (defaulting to 0!) and result["cwd"],
+        # and passes its tracked cwd back as the second positional argument.
+        env = make_env(self.fake)
+        self.fake.exec_code = 2
+        self.fake.exec_cwd = "/workspace/src"
+        result = env.execute("cd src && false", "/workspace")
+        self.assertEqual(result["returncode"], 2)
+        self.assertEqual(result["cwd"], "/workspace/src")
+        env.execute("ls", "/workspace/src", timeout=5, bounded_capture=True, rewrite_compound_background=False)
+        self.assertIn("cd /workspace/src", self.fake.calls[-1][-1])
+
+    def test_stdin_data_reaches_the_command_byte_exact(self):
+        import base64
+        env = make_env(self.fake)
+        data = "line one\nno trailing newline ✓"
+        env.execute("cat > /workspace/f.txt", stdin_data=data)
+        staged = [c[-1] for c in self.fake.calls if c[1] == "exec" and ".rewind-stdin-" in c[-1]]
+        chunk = staged[0].split("'")[3]
+        self.assertEqual(base64.b64decode(chunk).decode(), data)
+        self.assertTrue(any("base64 -d" in s for s in staged))
+        command = self.fake.calls[-1][-1]
+        self.assertRegex(command, r"\}\s*< /tmp/\.rewind-stdin-\w+")
+        self.assertIn("rm -f /tmp/.rewind-stdin-", command)
+
+    def test_large_stdin_is_chunked_under_the_argument_limit(self):
+        from rewind.environment import _STDIN_CHUNK
+        env = make_env(self.fake)
+        env.execute("cat > big", stdin_data="x" * 300_000)
+        appends = [c[-1] for c in self.fake.calls if c[1] == "exec" and ".b64" in c[-1] and ">>" in c[-1]]
+        self.assertGreater(len(appends), 1)
+        self.assertTrue(all(len(a) < _STDIN_CHUNK + 200 for a in appends))
 
     def test_exit_code_and_timeout(self):
         env = make_env(self.fake)
@@ -154,6 +188,14 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(len(run_calls), 2)
         self.assertIn(target.image, run_calls[-1])
         self.assertEqual(env.cwd, "/workspace/app")
+        # Hermes passes back the cwd it tracked before the restore; the
+        # restored directory wins for the next command and is reported.
+        self.fake.exec_cwd = "/workspace/app"
+        result = env.execute("ls", "/tmp")
+        self.assertIn("cd /workspace/app", self.fake.calls[-1][-1])
+        self.assertEqual(result["cwd"], "/workspace/app")
+        env.execute("ls", "/tmp")
+        self.assertIn("cd /tmp", self.fake.calls[-1][-1])  # only once
         # The restore is itself undoable.
         env.restore(safety.id)
 
@@ -376,6 +418,30 @@ class ToolTests(unittest.TestCase):
 
     def call(self, name, args=None, **kw):
         return json.loads(tools.HANDLERS[name](args or {}, **kw))
+
+    def test_tools_refuse_to_guess_between_sandboxes(self):
+        make_env(self.fake)
+        RewindEnvironment(task_id="other", runner=self.fake, background=False)
+        result = self.call("rewind_list", task_id="unknown")
+        self.assertFalse(result["ok"])
+        self.assertIn("won't guess", result["error"])
+        self.assertTrue(self.call("rewind_list", task_id="other")["ok"])
+
+    def test_tools_use_the_sandbox_hermes_maps_the_task_to(self):
+        # Inside Hermes, tool task_ids and sandbox keys differ (one shared
+        # "default" sandbox by default); Rewind asks Hermes which one it is.
+        import sys
+        import types
+        shared = RewindEnvironment(task_id="default", runner=self.fake, background=False)
+        RewindEnvironment(task_id="unrelated", runner=self.fake, background=False)
+        fake_mod = types.ModuleType("tools.terminal_tool_lifecycle")
+        fake_mod.get_active_env = lambda task_id: shared if task_id == "session-123" else None
+        sys.modules["tools.terminal_tool_lifecycle"] = fake_mod
+        try:
+            result = self.call("rewind_list", task_id="session-123")
+        finally:
+            del sys.modules["tools.terminal_tool_lifecycle"]
+        self.assertTrue(result["ok"], result)
 
     def test_tools_without_sandbox_return_error(self):
         result = self.call("rewind_list")

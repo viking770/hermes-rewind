@@ -3,9 +3,8 @@ version: 0.1.0
 description: Undoable Docker sandbox terminal backend. Every command that can change files is snapshotted first, so the agent (or you) can roll the sandbox back.
 author: Vikram Singh
 kind: backend
-# TODO before submitting: install Hermes, run `hermes --version`, and set this
-# to the oldest version you actually tested (catalog rule 14).
-requires_hermes: ">=0.22"
+# Oldest version tested end to end (catalog rule 14).
+requires_hermes: ">=0.22.7"
 provides_tools:
   - rewind_list
   - rewind_snapshot

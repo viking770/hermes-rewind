@@ -6,7 +6,7 @@ import shutil
 import subprocess
 
 from . import registry
-from .environment import RewindError
+from .environment import RewindEnvironment, RewindError
 
 TOOLSET = "rewind"
 
@@ -61,9 +61,27 @@ def _err(message: str) -> str:
     return json.dumps({"ok": False, "error": message})
 
 
+def _hermes_env(task_id):
+    """The sandbox Hermes's terminal tool uses for this task_id. Hermes keys
+    sandboxes by its own scheme (one shared "default" sandbox unless
+    container_persistent is false), so ask it rather than guess."""
+    try:
+        from tools.terminal_tool_lifecycle import get_active_env
+        env = get_active_env(task_id or "default")
+    except Exception:  # not running inside Hermes, or its internals changed
+        return None
+    return env if isinstance(env, RewindEnvironment) else None
+
+
 def _env(kwargs):
-    env = registry.get(kwargs.get("task_id"))
+    task_id = kwargs.get("task_id")
+    env = _hermes_env(task_id) or registry.get(task_id)
     if env is None:
+        if registry.count() > 1:
+            raise RewindError(
+                f"Several Rewind sandboxes are running and none belongs to task {task_id!r}, "
+                "so Rewind won't guess which one to act on."
+            )
         raise RewindError(
             "No Rewind sandbox is running. Set `hermes config set terminal.backend rewind` "
             "and run a terminal command first."

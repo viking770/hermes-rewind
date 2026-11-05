@@ -11,7 +11,7 @@ description: Undo button for the agent's terminal. A Docker sandbox backend that
 maintainer: viking770
 tier: community
 category: tools
-requires_hermes: ">=0.22"          # keep in sync with rewind/plugin.yaml
+requires_hermes: ">=0.22.7"        # keep in sync with rewind/plugin.yaml
 docs_url: https://github.com/viking770/hermes-rewind#readme
 platforms: [macos, linux, windows]
 capabilities:

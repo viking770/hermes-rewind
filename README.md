@@ -30,6 +30,7 @@ Requires Docker (Docker Desktop on macOS/Windows, Docker Engine on Linux).
 - `cd` carries over between commands, and restoring also restores the working directory.
 - Rewind talks to the Docker Engine API over the daemon's socket (a named pipe on Windows), which skips the 0.5 to 1 second it takes to start the `docker` CLI on Docker Desktop. If the API can't be reached, for example with a `tcp://` `DOCKER_HOST`, it uses the CLI.
 - When the session ends, the container and all snapshot images are removed.
+- By default Hermes shares one sandbox between sessions (`terminal.container_persistent: true`). Set `hermes config set terminal.container_persistent false` to give each session its own sandbox and its own snapshots. The `rewind_*` tools always act on the sandbox Hermes uses for the calling session, and refuse to guess if they can't tell.
 
 ## Agent tools
 

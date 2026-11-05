@@ -8,6 +8,7 @@ plugin has no Python dependencies.
 """
 from __future__ import annotations
 
+import base64
 import re
 import shlex
 import subprocess
@@ -28,6 +29,7 @@ DEFAULT_COMPACT_MB = 256
 # so stop compacting well before that and let snapshots grow instead.
 MAX_LAYERS = 100
 _CWD_MARKER = "__REWIND_CWD__"
+_STDIN_CHUNK = 96 * 1024  # base64 characters per command, under Linux's 128 KB argument limit
 _SLUG = re.compile(r"[^a-z0-9]+")
 
 # A runner takes (argv, timeout_seconds) and returns (exit_code, combined_output).
@@ -135,6 +137,7 @@ class RewindEnvironment:
         # so the worker never runs alongside anything else.
         self._pending: Optional[_Pending] = None
         self._worker: Optional[threading.Thread] = None
+        self._cwd_from_restore = False
         self._lock = threading.RLock()
         registry.add(task_id, self)
 
@@ -175,14 +178,28 @@ class RewindEnvironment:
         self._started = True
 
     # ----------------------------------------------------------- environment
-    def execute(self, command: str, timeout: Optional[int] = None, **kwargs) -> dict:
+    def execute(
+        self, command: str, cwd: str = "", *, timeout: Optional[int] = None,
+        stdin_data: Optional[str] = None, **kwargs,
+    ) -> dict:
+        """Run ``command`` in the sandbox. Follows Hermes's environment contract:
+        returns ``output`` and ``returncode`` (plus ``exit_code`` for older
+        callers), and ``cwd`` when the command reported its final directory.
+        ``stdin_data`` (how Hermes's file tools send file contents) is fed to
+        the command's stdin."""
         with self._lock:
             self._finish_background()
-            cwd = kwargs.get("cwd") or self.cwd
+            if self._cwd_from_restore:
+                # Hermes passes the directory it tracked before the restore;
+                # the restored snapshot's directory wins once, and the result
+                # reports it so Hermes tracks that from now on.
+                self._cwd_from_restore = False
+                cwd = self.cwd
+            cwd = cwd or self.cwd
             try:
                 self._ensure_started()
             except (RewindError, subprocess.TimeoutExpired, OSError) as exc:
-                return {"output": f"[rewind] could not start the sandbox: {exc}", "exit_code": 1}
+                return _result(f"[rewind] could not start the sandbox: {exc}", 1)
 
             note = ""
             if policy.should_snapshot(command, self.snapshot_mode):
@@ -193,10 +210,16 @@ class RewindEnvironment:
             try:
                 self._ensure_started()  # in case a compaction could not restart it
             except (RewindError, subprocess.TimeoutExpired, OSError) as exc:
-                return {"output": f"[rewind] could not start the sandbox: {exc}", "exit_code": 1}
+                return _result(f"[rewind] could not start the sandbox: {exc}", 1)
 
             limit = timeout or self.timeout
-            argv = [self.docker_bin, "exec", self.container, self._shell, "-c", _wrap(command, cwd)]
+            stdin_file = None
+            if stdin_data is not None:
+                try:
+                    stdin_file = self._stage_stdin(stdin_data)
+                except (RewindError, subprocess.TimeoutExpired, OSError) as exc:
+                    return _result(f"[rewind] could not pass stdin to the command: {exc}", 1)
+            argv = [self.docker_bin, "exec", self.container, self._shell, "-c", _wrap(command, cwd, stdin_file)]
             try:
                 code, out = self._run(argv, limit)
             except subprocess.TimeoutExpired as exc:
@@ -210,7 +233,24 @@ class RewindEnvironment:
             # what to do. A read-only command leaves the pending snapshot valid.
             if self._pending is None:
                 self._start_background()
-            return {"output": note + output, "exit_code": code}
+            return _result(note + output, code, new_cwd)
+
+    def _stage_stdin(self, data: str) -> str:
+        """Write ``data`` to a temp file in the sandbox and return its path.
+
+        Docker can't close an exec's stdin over a Windows named pipe, so the
+        bytes travel base64-encoded inside commands instead: portable to any
+        shell with ``base64``, and byte-exact (Hermes's write_file checks a
+        hash). Large payloads go in chunks to stay under Linux's 128 KB limit
+        on a single argument."""
+        path = f"/tmp/.rewind-stdin-{uuid.uuid4().hex[:12]}"
+        encoded = base64.b64encode(data.encode("utf-8")).decode("ascii")
+        for start in range(0, max(len(encoded), 1), _STDIN_CHUNK):
+            chunk = encoded[start:start + _STDIN_CHUNK]
+            self._docker("exec", self.container, "sh", "-c", f"printf '%s' '{chunk}' >> {path}.b64", timeout=60)
+        self._docker("exec", self.container, "sh", "-c",
+                     f"base64 -d {path}.b64 > {path} && rm -f {path}.b64", timeout=60)
+        return path
 
     def cleanup(self) -> None:
         with self._lock:
@@ -375,6 +415,7 @@ class RewindEnvironment:
             self._started = True
             self._carried_changes.clear()
             self.cwd = target.cwd
+            self._cwd_from_restore = True
             self._start_background()  # ready for the first change after the restore
             return target, safety
 
@@ -410,9 +451,22 @@ def _merge_diff(changes: Dict[str, str], diff: str) -> None:
             changes[path] = kind
 
 
-def _wrap(command: str, cwd: str) -> str:
-    """Run ``command`` in ``cwd`` and report the final directory so cd persists."""
+def _result(output: str, code: int, cwd: Optional[str] = None) -> dict:
+    result = {"output": output, "returncode": code, "exit_code": code}
+    if cwd:
+        # Hermes records a session's cwd only when cwd_observed is set.
+        result["cwd"] = cwd
+        result["cwd_observed"] = True
+    return result
+
+
+def _wrap(command: str, cwd: str, stdin_file: Optional[str] = None) -> str:
+    """Run ``command`` in ``cwd`` and report the final directory so cd persists.
+    With ``stdin_file``, the command reads it as stdin and it is removed after."""
     q = shlex.quote(cwd)
+    if stdin_file:
+        # A group, not a subshell, so a `cd` inside still carries over.
+        command = f"{{\n{command}\n}} < {stdin_file}\n__rewind_rc=$?\nrm -f {stdin_file}\n(exit $__rewind_rc)"
     return (
         f"cd {q} 2>/dev/null || {{ mkdir -p {q} && cd {q}; }}\n"
         f"{command}\n"
