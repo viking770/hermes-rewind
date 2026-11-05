@@ -7,10 +7,11 @@ import os
 import stat
 import tarfile
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
-from rewind import policy, registry, store as store_mod, tools
+from rewind import audit, policy, registry, store as store_mod, tools
 from rewind.docker_api import ApiRunner, _bytes
 from rewind.redact import MASK, redact
 from rewind.store import Store
@@ -361,6 +362,155 @@ class SecretRetentionTests(unittest.TestCase):
         rmi = next(c for c in fake.calls if c[1] == "rmi")
         self.assertIn("hermes-rewind/p-1:s1", rmi)
         self.assertNotIn("rm", [c[1] for c in fake.calls if "hermes-rewind-l-1" in c])
+
+
+class RecordValidationTests(unittest.TestCase):
+    """L1: a tampered record can't steer docker at anything that isn't Rewind's."""
+
+    GOOD = {"task_id": "t", "status": "parked", "repository": "hermes-rewind/t-1",
+            "container": "hermes-rewind-t-1", "base_image": "python:3.12-slim",
+            "image": "hermes-rewind/t-1:s3", "snapshots": [{"id": "s1", "image": "hermes-rewind/t-1:s1"}],
+            "dropped_images": ["hermes-rewind/t-1:s2"], "owner_pid": None, "seq": 3, "cwd": "/workspace",
+            "expires_at": 1.0}
+
+    def test_rewinds_own_records_pass(self):
+        self.assertTrue(store_mod.is_valid_record(dict(self.GOOD)))
+
+    def test_tampered_records_are_rejected(self):
+        bad = {
+            "foreign container": {"container": "my-database"},
+            "foreign image": {"image": "evil/backdoor:latest"},
+            "option as image": {"image": "--privileged"},
+            "other repository's snapshot": {"snapshots": [{"image": "hermes-rewind/other-1:s1"}]},
+            "foreign dropped image": {"dropped_images": ["postgres:16"]},
+            "foreign repository": {"repository": "library/python"},
+            "option as base image": {"base_image": "--privileged"},
+            "pid not a number": {"owner_pid": "1; rm -rf /"},
+            "relative cwd": {"cwd": "workspace"},
+            "unknown status": {"status": "owned"},
+            "snapshots not a list": {"snapshots": "hermes-rewind/t-1:s1"},
+        }
+        for name, change in bad.items():
+            self.assertFalse(store_mod.is_valid_record({**self.GOOD, **change}), name)
+
+    def test_store_ignores_invalid_records_entirely(self):
+        store = Store(Path(tempfile.mkdtemp()))
+        store.save({**self.GOOD, "container": "my-database", "status": "live", "owner_pid": 99999999})
+        self.assertIsNone(store.load("t"))
+        self.assertEqual(list(store.records()), [])
+        fake = FakeDocker()
+        store_mod.reap(store, fake, keep_seconds=3600)
+        store_mod.purge(store, fake)
+        self.assertFalse([c for c in fake.calls if "my-database" in c])
+
+
+class SizeCapTests(unittest.TestCase):
+    """L4: parked snapshots can't grow without bound."""
+
+    def test_oldest_parked_sandboxes_go_first_until_under_the_cap(self):
+        store = Store(Path(tempfile.mkdtemp()))
+        base = "python:3.12-slim"
+        for i, age in enumerate((300, 200, 100)):  # parked 300 s, 200 s, 100 s ago
+            store.save({"task_id": f"t{i}", "status": "parked", "repository": f"hermes-rewind/t-{i}",
+                        "base_image": base, "image": f"hermes-rewind/t-{i}:s2",
+                        "snapshots": [{"id": "s1", "image": f"hermes-rewind/t-{i}:s1", "parent": base}],
+                        "parked_at": time.time() - age, "expires_at": time.time() + 3600})
+        store.save({"task_id": "busy", "status": "live", "repository": "hermes-rewind/busy-1",
+                    "owner_pid": os.getpid(), "host": store_mod.hostname(), "base_image": base})
+
+        class Sizes(FakeDocker):
+            # Every snapshot and parked state adds 1 GB on top of a 0.1 GB base.
+            def __call__(self, argv, timeout=None):
+                if argv[1:4] == ["image", "inspect", "-f"] and argv[4] == "{{.Size}}":
+                    self.calls.append(list(argv))
+                    return 0, "".join(("100000000" if a == base else str(1024 ** 3 + 100000000)) + "\n"
+                                      for a in argv[5:])
+                return super().__call__(argv, timeout)
+
+        fake = Sizes()
+        counts = store_mod.reap(store, fake, keep_seconds=3600, max_parked_bytes=int(2.5 * 1024 ** 3))
+        # Each parked sandbox uses ~2 GB (two images); 6 GB > 2.5 GB, so the two oldest go.
+        self.assertEqual(counts["over_size_cap"], 2)
+        self.assertIsNone(store.load("t0"))
+        self.assertIsNone(store.load("t1"))
+        self.assertIsNotNone(store.load("t2"))
+        self.assertIsNotNone(store.load("busy"))  # live: never evicted
+
+    def test_no_cap_means_nothing_is_evicted(self):
+        store = Store(Path(tempfile.mkdtemp()))
+        store.save({"task_id": "t", "status": "parked", "repository": "hermes-rewind/t-1",
+                    "image": "hermes-rewind/t-1:s1", "expires_at": time.time() + 3600})
+        self.assertEqual(store_mod.reap(store, FakeDocker(), keep_seconds=3600)["over_size_cap"], 0)
+        self.assertIsNotNone(store.load("t"))
+
+
+class AuditLogTests(unittest.TestCase):
+    """L3: a person can see afterwards what happened."""
+
+    def setUp(self):
+        registry.clear()
+        self.log = audit.path()
+        for f in (self.log, self.log.with_name("audit.log.1")):
+            if f.exists():
+                f.unlink()
+
+    def events(self):
+        return list(audit.tail(200))
+
+    def test_restores_exports_forget_and_approvals_are_logged(self):
+        fake = FakeDocker()
+        env = RewindEnvironment(task_id="session:chat-a", runner=fake, background=False, network="none")
+        env.execute("rm a")
+        tools.slash_rewind("undo", session_key="chat-a", platform="local")
+        json.loads(tools.HANDLERS["rewind_undo"]({}, task_id="chat-a"))
+        env._tar_reader = fake_tar_reader([])
+        os.environ["REWIND_EXPORT_DIR"] = tempfile.mkdtemp()
+        try:
+            tools.HANDLERS["rewind_export"]({"path": "app"}, task_id="chat-a")
+        finally:
+            del os.environ["REWIND_EXPORT_DIR"]
+        tools.slash_rewind("forget yes", session_key="chat-a")
+        tools.pre_tool_call(tool_name="terminal", args={"command": "TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123 git push"})
+        events = self.events()
+        kinds = [(e["event"], e["via"]) for e in events]
+        for expected in [("undo", "/rewind"), ("undo", "agent"), ("export", "agent"), ("forget", "/rewind"),
+                         ("approval_requested", "agent")]:
+            self.assertIn(expected, kinds)
+        undo = next(e for e in events if e["event"] == "undo")
+        self.assertEqual(undo["task_id"], "session:chat-a")
+        self.assertEqual(undo["snapshot"], "s1")
+        export = next(e for e in events if e["event"] == "export")
+        self.assertIn("app/trap", export["skipped_paths"])
+        self.assertNotIn("ghp_abcdef", self.log.read_text(encoding="utf-8"))  # redacted
+
+    def test_refused_export_is_logged(self):
+        tools.slash_rewind("export x", session_key="k", platform="telegram")
+        self.assertEqual(self.events()[-1]["event"], "export_refused")
+
+    def test_rotation_and_off_switch(self):
+        saved = audit.MAX_BYTES
+        audit.MAX_BYTES = 400
+        try:
+            for i in range(20):
+                audit.log("test", n=i)
+        finally:
+            audit.MAX_BYTES = saved
+        self.assertTrue(self.log.with_name("audit.log.1").exists())
+        self.assertLessEqual(self.log.stat().st_size, 400)
+        self.assertEqual(self.events()[-1]["n"], 19)
+        os.environ["REWIND_AUDIT"] = "0"
+        try:
+            audit.log("hidden")
+        finally:
+            del os.environ["REWIND_AUDIT"]
+        self.assertNotEqual(self.events()[-1]["event"], "hidden")
+
+    def test_describe_is_one_readable_line(self):
+        line = audit.describe({"time": "2026-11-06T01:00:00", "event": "undo", "via": "/rewind",
+                               "task_id": "session:x", "snapshot": "s2"})
+        self.assertIn("undo", line)
+        self.assertIn("snapshot=s2", line)
+        self.assertNotIn("\n", line)
 
 
 class WrappedCommandTests(unittest.TestCase):

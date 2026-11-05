@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import time
 
-from . import policy, registry, settings, store as store_mod, version
+from . import audit, policy, registry, settings, store as store_mod, version
 from .environment import RewindError, Snapshot, describe_changes, subprocess_runner
 
 TOOLSET = "rewind"
@@ -147,7 +147,15 @@ def _with_status(data: dict) -> dict:
     return data
 
 
-def _restored(env, target, safety) -> dict:
+def _audit_restore(env, target, safety, *, via: str, event: str, **extra) -> None:
+    changes = env.last_restore_changes or {}
+    audit.log(event, task_id=env.task_id, via=via, snapshot=target.id, state=target.state(),
+              undo_with=safety.id, files_back=changes.get("appear_count"),
+              files_gone=changes.get("disappear_count"), **extra)
+
+
+def _restored(env, target, safety, event: str = "restore") -> dict:
+    _audit_restore(env, target, safety, via="agent", event=event)
     changes = env.last_restore_changes
     return {
         "restored": target.describe(),
@@ -193,7 +201,7 @@ def rewind_restore(args, **kwargs):
 def rewind_undo(args, **kwargs):
     env = _env(kwargs)
     target, safety = env.undo()
-    return _ok(**_with_status(_restored(env, target, safety)))
+    return _ok(**_with_status(_restored(env, target, safety, event="undo")))
 
 
 @_guard
@@ -208,6 +216,7 @@ def rewind_export(args, **kwargs):
         raise RewindError("Pass the path of a file or folder in the sandbox.")
     surface = _surface()
     if not is_local(surface):
+        audit.log("export_refused", task_id=kwargs.get("task_id"), via="agent", path=path, surface=surface)
         raise RewindError(
             f"rewind_export writes to the Hermes host's disk, so it is only available in local chats "
             f"(this one is on {surface}). Show the user the file contents instead."
@@ -215,6 +224,8 @@ def rewind_export(args, **kwargs):
     env = _env(kwargs)
     copied = env.export(path, settings.export_dir())
     removed = env.last_export_removed
+    audit.log("export", task_id=env.task_id, via="agent", path=path, host_path=str(copied),
+              skipped=len(removed), skipped_paths=removed[:20])
     note = (f" Removed {len(removed)} symlink(s) or special file(s) that could point elsewhere on "
             f"this computer: {', '.join(removed[:10])}." if removed else "")
     return _ok(host_path=str(copied), removed=removed,
@@ -339,6 +350,7 @@ def slash_rewind(raw_args: str = "", session_key=None, session_id=None, platform
         if sub == "status":
             return _status_text(include_records=local) + stale
         if sub == "export" and not local:
+            audit.log("export_refused", via="/rewind", path=" ".join(rest), platform=platform)
             return ("Rewind: /rewind export writes to the Hermes host's disk, so it only works from a "
                     "local chat (CLI, TUI or desktop app), not from a messaging platform.")
         env = _session_env(session_key, session_id, platform)
@@ -348,6 +360,7 @@ def slash_rewind(raw_args: str = "", session_key=None, session_id=None, platform
             if sub == "restore" and not rest:
                 return "Usage: /rewind restore ID (see /rewind for ids)."
             target, safety = env.undo() if sub == "undo" else env.restore(rest[0])
+            _audit_restore(env, target, safety, via="/rewind", event=sub, platform=platform)
             return (f"Rolled back to {target.id} ({target.state()}).\n"
                     f"{describe_changes(env.last_restore_changes)}\n"
                     f"To undo this, run /rewind restore {safety.id}." + stale)
@@ -359,7 +372,9 @@ def slash_rewind(raw_args: str = "", session_key=None, session_id=None, platform
                 return (f"This deletes all {len(env.snapshots)} snapshot(s) of this chat's sandbox now, so "
                         "nothing before this point can be undone. The files as they are now stay.\n"
                         "Run /rewind forget yes to go ahead.")
-            return f"Deleted {env.forget()} snapshot(s). New changes are snapshotted as usual from here."
+            deleted = env.forget()
+            audit.log("forget", task_id=env.task_id, via="/rewind", deleted=deleted, platform=platform)
+            return f"Deleted {deleted} snapshot(s). New changes are snapshotted as usual from here."
         if sub == "changes":
             changes = env.changes()
             return "\n".join(changes) if changes else "No changes since the sandbox started or was restored."
@@ -368,6 +383,8 @@ def slash_rewind(raw_args: str = "", session_key=None, session_id=None, platform
                 return "Usage: /rewind export PATH (a file or folder in the sandbox)."
             copied = env.export(rest[0], settings.export_dir())
             removed = env.last_export_removed
+            audit.log("export", task_id=env.task_id, via="/rewind", path=rest[0], host_path=str(copied),
+                      skipped=len(removed), skipped_paths=removed[:20], platform=platform)
             return f"Copied to {copied}" + (
                 f"\nRemoved {len(removed)} symlink(s) or special file(s): {', '.join(removed[:10])}"
                 if removed else "")
@@ -403,9 +420,13 @@ def _status_text(include_records: bool = True) -> str:
 
 def run_gc() -> dict:
     """Delete expired snapshots and leftovers of dead processes now."""
-    return store_mod.reap(store_mod.Store(settings.state_dir()), subprocess_runner,
-                          keep_seconds=settings.keep_hours() * 3600,
-                          live_repositories=registry.repositories())
+    counts = store_mod.reap(store_mod.Store(settings.state_dir()), subprocess_runner,
+                            keep_seconds=settings.keep_hours() * 3600,
+                            live_repositories=registry.repositories(),
+                            max_parked_bytes=settings.max_parked_bytes())
+    if any(counts.values()):
+        audit.log("cleanup", **counts)
+    return counts
 
 
 def run_purge(exports: bool = False) -> dict:
@@ -415,6 +436,7 @@ def run_purge(exports: bool = False) -> dict:
         folder = settings.export_dir()
         counts["exports_deleted"] = int(folder.is_dir())
         shutil.rmtree(folder, ignore_errors=True)
+    audit.log("purge", via="cli", **counts)
     return counts
 
 
@@ -422,6 +444,8 @@ def _cli_setup(parser) -> None:
     sub = parser.add_subparsers(dest="rewind_command")
     sub.add_parser("status", help="Show the plugin version and recorded sandboxes")
     sub.add_parser("gc", help="Delete expired snapshots and leftovers from crashed sessions")
+    log = sub.add_parser("log", help="Show recent entries of Rewind's audit log")
+    log.add_argument("-n", type=int, default=30, help="how many entries (default 30)")
     purge = sub.add_parser("purge", help="Delete all kept snapshots now, without waiting for them to expire")
     purge.add_argument("--exports", action="store_true", help="also delete everything exported to this computer")
 
@@ -431,6 +455,13 @@ def _cli_handler(args) -> int:
     if command == "gc":
         counts = run_gc()
         print("Rewind cleanup: " + ", ".join(f"{v} {k}" for k, v in counts.items()))
+    elif command == "log":
+        entries = list(audit.tail(max(1, getattr(args, "n", 30))))
+        print(f"Audit log: {audit.path()}" + ("" if audit.enabled() else " (off: REWIND_AUDIT=0)"))
+        for entry in entries:
+            print(audit.describe(entry))
+        if not entries:
+            print("No entries yet.")
     elif command == "purge":
         counts = run_purge(exports=getattr(args, "exports", False))
         print(f"Deleted {counts['purged']} kept sandbox(es) and their snapshots.")
@@ -456,6 +487,7 @@ def pre_tool_call(tool_name: str = "", args=None, task_id=None, **_ignored):
         if not settings.confirm_export():
             return None
         path = str(args.get("path", "?"))[:200]
+        audit.log("approval_requested", task_id=task_id, via="agent", action="export", path=path)
         return {
             "action": "approve",
             "message": (f"The agent wants to copy {path!r} out of the Rewind sandbox onto this computer "
@@ -472,6 +504,8 @@ def pre_tool_call(tool_name: str = "", args=None, task_id=None, **_ignored):
     reason = policy.irreversible_reason(command)
     if not reason:
         return None
+    audit.log("approval_requested", task_id=task_id, via="agent", action=_rule_key(reason), reason=reason,
+              command=command)
     return {
         "action": "approve",
         "message": f"Rewind can't undo this: {reason}. Snapshots only cover the sandbox's files. Run it?",

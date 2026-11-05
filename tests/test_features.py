@@ -200,18 +200,18 @@ class ReapTests(unittest.TestCase):
 
     def test_live_record_with_dead_owner_becomes_parked(self):
         self.store.save({"task_id": "t", "status": "live", "repository": "hermes-rewind/t-1",
-                         "container": "c1", "owner_pid": DEAD_PID, "host": store_mod.hostname(),
-                         "image": "python:3.12-slim"})
+                         "container": "hermes-rewind-t-1", "owner_pid": DEAD_PID, "host": store_mod.hostname(),
+                         "image": "python:3.12-slim", "base_image": "python:3.12-slim"})
         self.assertEqual(self.reap()["recovered"], 1)
         record = self.store.load("t")
         self.assertEqual(record["status"], "parked")
         self.assertEqual(record["image"], "hermes-rewind/t-1:recovered")
-        self.assertIn(["docker", "rm", "-f", "c1"], self.fake.calls)
+        self.assertIn(["docker", "rm", "-f", "hermes-rewind-t-1"], self.fake.calls)
 
     def test_live_record_with_live_owner_is_left_alone(self):
         self.store.save({"task_id": "t", "status": "live", "repository": "hermes-rewind/t-1",
-                         "container": "c1", "owner_pid": os.getpid(), "host": store_mod.hostname()})
-        self.assertEqual(self.reap(), {"expired": 0, "recovered": 0, "containers": 0, "images": 0})
+                         "container": "hermes-rewind-t-1", "owner_pid": os.getpid(), "host": store_mod.hostname()})
+        self.assertFalse(any(self.reap().values()))
 
     def test_unrecorded_leftovers_of_dead_processes_are_deleted(self):
         host = store_mod.hostname()
@@ -467,7 +467,7 @@ class UndoToolAndSlashTests(unittest.TestCase):
         self.assertIn("only works from a local chat", tools.slash_rewind("export work", **mine))
         self.assertNotIn("cp", self.fake.verbs())
         # status from a platform shows no other chats.
-        Store(Path(os.environ["REWIND_STATE_DIR"])).save({"task_id": "someone-else", "status": "parked"})
+        Store(Path(os.environ["REWIND_STATE_DIR"])).save({"task_id": "someone-else", "status": "parked", "repository": "hermes-rewind/someone-1"})
         try:
             self.assertNotIn("someone-else", tools.slash_rewind("status", platform="telegram"))
             self.assertIn("someone-else", tools.slash_rewind("status", platform="local"))

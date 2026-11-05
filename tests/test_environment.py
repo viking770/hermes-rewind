@@ -4,7 +4,7 @@ import time
 import unittest
 
 from rewind import RewindProvider, registry, tools
-from rewind.environment import GUARD_IMAGE, RewindEnvironment, RewindError, _CWD_MARKER
+from rewind.environment import DEFAULT_IMAGE, GUARD_IMAGE, RewindEnvironment, RewindError, _CWD_MARKER
 
 
 class FakeDocker:
@@ -540,7 +540,8 @@ class ToolTests(unittest.TestCase):
     def test_provider_creates_environment(self):
         env = RewindProvider().create_environment(cwd="~", timeout=30, task_id="t1", image="")
         self.assertEqual(env.cwd, "/workspace")
-        self.assertEqual(env.base_image, "python:3.12-slim")
+        self.assertEqual(env.base_image, DEFAULT_IMAGE)
+        self.assertIn("@sha256:", env.base_image)  # pinned
         self.assertIs(registry.get("t1"), env)
 
 

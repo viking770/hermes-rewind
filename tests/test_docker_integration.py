@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 
 from rewind import registry
-from rewind.environment import RewindEnvironment
+from rewind.environment import DEFAULT_IMAGE, RewindEnvironment
 from rewind.store import Store
 
 
@@ -22,7 +22,7 @@ class DockerIntegrationTest(unittest.TestCase):
     def setUp(self):
         registry.clear()
         self.env = RewindEnvironment(task_id="integration", timeout=120,
-                                     image=os.environ.get("REWIND_IMAGE", "python:3.12-slim"))
+                                     image=os.environ.get("REWIND_IMAGE", DEFAULT_IMAGE))
         self.addCleanup(self.env.cleanup)
 
     def test_undo_a_destructive_command(self):
@@ -108,7 +108,7 @@ class DockerIntegrationTest(unittest.TestCase):
 
     def test_snapshots_survive_cleanup_and_resume(self):
         store = Store(Path(tempfile.mkdtemp()))
-        image = os.environ.get("REWIND_IMAGE", "python:3.12-slim")
+        image = os.environ.get("REWIND_IMAGE", DEFAULT_IMAGE)
         first = RewindEnvironment(task_id="integration-park", timeout=120, image=image,
                                   keep_hours=1, store=store)
         try:

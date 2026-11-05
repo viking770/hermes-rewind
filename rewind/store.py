@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import socket
 import time
 from pathlib import Path
@@ -106,7 +107,64 @@ def _read(path: Path) -> Optional[dict]:
         record = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    return record if isinstance(record, dict) and record.get("format") == FORMAT else None
+    if not isinstance(record, dict) or record.get("format") != FORMAT:
+        return None
+    return record if is_valid_record(record) else None
+
+
+# What Rewind itself writes. Anything else in a record (edited by hand, or by
+# something that shouldn't) is rejected, so no record field can become an
+# arbitrary container name, image or docker option.
+REPOSITORY_RE = re.compile(r"hermes-rewind/[a-z0-9][a-z0-9-]{0,100}")
+CONTAINER_RE = re.compile(r"hermes-rewind-[a-z0-9][a-z0-9-]{0,100}")
+_TAG_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}")
+_IMAGE_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:@+-]{0,255}")
+
+
+def is_valid_record(record: dict) -> bool:
+    try:
+        repo = record.get("repository")
+        if not isinstance(record.get("task_id"), str) or not record["task_id"]:
+            return False
+        if not isinstance(repo, str) or not REPOSITORY_RE.fullmatch(repo):
+            return False
+
+        def own_image(image) -> bool:
+            if not isinstance(image, str):
+                return False
+            name, _, tag = image.rpartition(":")
+            return name == repo and bool(_TAG_RE.fullmatch(tag))
+
+        base = record.get("base_image")
+        if base is not None and not (isinstance(base, str) and _IMAGE_REF_RE.fullmatch(base)):
+            return False
+        image = record.get("image")
+        if image not in (None, "") and not (own_image(image) or image == base):
+            return False
+        container = record.get("container")
+        if container is not None and not (isinstance(container, str) and CONTAINER_RE.fullmatch(container)):
+            return False
+        snapshots = record.get("snapshots", [])
+        if not isinstance(snapshots, list) or not all(
+                isinstance(s, dict) and own_image(s.get("image")) for s in snapshots):
+            return False
+        dropped = record.get("dropped_images", [])
+        if not isinstance(dropped, list) or not all(own_image(i) for i in dropped):
+            return False
+        for key in ("owner_pid", "seq"):
+            value = record.get(key)
+            if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
+                return False
+        for key in ("expires_at", "parked_at", "updated_at"):
+            value = record.get(key)
+            if value is not None and not isinstance(value, (int, float)):
+                return False
+        cwd = record.get("cwd")
+        if cwd is not None and not (isinstance(cwd, str) and cwd.startswith("/") and "\n" not in cwd):
+            return False
+        return record.get("status") in ("live", "parked")
+    except (TypeError, AttributeError):
+        return False
 
 
 def record_images(record: dict) -> List[str]:
@@ -171,40 +229,68 @@ def purge(store: Store, run: Runner, *, docker_bin: str = "docker") -> Dict[str,
                 and pid_alive(record.get("owner_pid")):
             counts["skipped_live"] += 1
             continue
-        repo = record.get("repository", "")
-        images = set(record_images(record))
-        if repo.startswith("hermes-rewind/"):
+        def docker(*args, timeout=120.0):
             try:
-                code, out = run([docker_bin, "images", repo, "--format", "{{.Repository}}:{{.Tag}}"], 60)
-            except Exception:
-                code, out = 1, ""
-            if code == 0:
-                images |= {i.strip() for i in out.splitlines() if i.strip().startswith(repo + ":")}
+                return run([docker_bin, *args], timeout)
+            except Exception as exc:
+                return 1, str(exc)
+
         container = record.get("container") or ""
-        try:
-            if container.startswith("hermes-rewind-"):
-                run([docker_bin, "rm", "-f", container], 60)
-            if images:
-                run([docker_bin, "rmi", "-f", *sorted(images)], 300)
-        except Exception:
-            pass
-        store.delete(record["task_id"])
+        if container:  # a dead owner's container (validated as Rewind's own when read)
+            docker("rm", "-f", container, timeout=60)
+        _delete_record(store, record, docker)
         counts["purged"] += 1
     return counts
 
 
 # ------------------------------------------------------------------ reaping
+def _delete_record(store: Store, record: dict, docker) -> None:
+    """Delete a parked sandbox: every image in its repository, then its record."""
+    repo = record.get("repository", "")
+    images = set(record_images(record))
+    if repo.startswith("hermes-rewind/"):  # plus any the record missed (e.g. after a crash)
+        code, out = docker("images", repo, "--format", "{{.Repository}}:{{.Tag}}", timeout=60)
+        if code == 0:
+            images |= {i.strip() for i in out.splitlines() if i.strip().startswith(repo + ":")}
+    if images:
+        docker("rmi", "-f", *sorted(images), timeout=300)
+    store.delete(record["task_id"])
+
+
+def record_bytes(record: dict, docker) -> int:
+    """Roughly how much disk a parked sandbox's own images use: each image's size
+    minus the image it was committed on top of (shared base layers aren't counted)."""
+    images = record_images(record)
+    parents = {s.get("image"): s.get("parent") for s in record.get("snapshots", [])}
+    base = record.get("base_image") or ""
+    wanted = sorted(set(images) | {p for p in parents.values() if p} | ({base} if base else set()))
+    if not wanted:
+        return 0
+    code, out = docker("image", "inspect", "-f", "{{.Size}}", *wanted, timeout=120)
+    sizes = {}
+    if code == 0:
+        for name, line in zip(wanted, out.splitlines()):
+            sizes[name] = int(line.strip()) if line.strip().isdigit() else 0
+    total = 0
+    for image in images:
+        parent = parents.get(image) or base
+        total += max(0, sizes.get(image, 0) - sizes.get(parent, 0))
+    return total
+
+
 def reap(store: Store, run: Runner, *, keep_seconds: float, live_repositories: Sequence[str] = (),
-         docker_bin: str = "docker", now: Optional[float] = None) -> Dict[str, int]:
+         docker_bin: str = "docker", now: Optional[float] = None, max_parked_bytes: int = 0) -> Dict[str, int]:
     """Delete expired snapshots and leftovers whose owner is gone. Returns counts.
 
     ``live_repositories`` are image repositories this process is using right now;
     they are never touched. Records owned by another live process are skipped.
+    With ``max_parked_bytes``, parked sandboxes are also deleted oldest first
+    until together they use no more than that.
     """
     now = now or time.time()
     host = hostname()
     live = set(live_repositories)
-    counts = {"expired": 0, "recovered": 0, "containers": 0, "images": 0}
+    counts = {"expired": 0, "recovered": 0, "containers": 0, "images": 0, "over_size_cap": 0}
 
     def docker(*args: str, timeout: float = 120.0) -> Tuple[int, str]:
         try:
@@ -234,16 +320,22 @@ def reap(store: Store, run: Runner, *, keep_seconds: float, live_repositories: S
             store.save(record)
             counts["recovered"] += 1
         if record.get("status") == "parked" and is_expired(record, now):
-            images = set(record_images(record))
-            if repo.startswith("hermes-rewind/"):  # plus any the record missed (e.g. after a crash)
-                code, out = docker("images", repo, "--format", "{{.Repository}}:{{.Tag}}", timeout=60)
-                if code == 0:
-                    images |= {i.strip() for i in out.splitlines() if i.strip().startswith(repo + ":")}
-            images = sorted(images)
-            if images:
-                docker("rmi", "-f", *images, timeout=300)
-            store.delete(record["task_id"])
+            _delete_record(store, record, docker)
             counts["expired"] += 1
+
+    # The size cap: oldest parked sandboxes go first. Live ones are never touched.
+    if max_parked_bytes:
+        parked = sorted((r for r in store.records()
+                         if r.get("status") == "parked" and r.get("repository") not in live),
+                        key=lambda r: float(r.get("parked_at") or r.get("updated_at") or 0))
+        sized = [(r, record_bytes(r, docker)) for r in parked]
+        total = sum(size for _, size in sized)
+        for record, size in sized:
+            if total <= max_parked_bytes:
+                break
+            _delete_record(store, record, docker)
+            total -= size
+            counts["over_size_cap"] += 1
 
     # Labelled leftovers no record knows about, from a dead process on this machine.
     fmt = '{{.ID}}\t{{.Label "%s"}}\t{{.Label "%s"}}\t%s'

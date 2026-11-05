@@ -25,12 +25,16 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from . import policy, registry, store as store_mod
+from . import audit, policy, registry, store as store_mod
 from .docker_api import ApiRunner
 from .redact import redact
 from .store import Store
 
-DEFAULT_IMAGE = "python:3.12-slim"
+# Pinned by digest: a tag on Docker Hub can be re-pointed, a digest can't. This is the
+# multi-platform index (amd64, arm64, ...) of python:3.12-slim built 2026-10-28.
+# To update: `docker pull python:3.12-slim` then
+# `docker image inspect python:3.12-slim -f "{{index .RepoDigests 0}}"`. REWIND_IMAGE overrides it.
+DEFAULT_IMAGE = "python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159"
 DEFAULT_CWD = "/workspace"
 DEFAULT_MAX_SNAPSHOTS = 25
 DEFAULT_COMPACT_MB = 256
@@ -67,7 +71,7 @@ _BLOCKED_V4 = ("0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.2
                "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15",
                "224.0.0.0/4", "240.0.0.0/4")
 _BLOCKED_V6 = ("::1/128", "::ffff:0:0/96", "fc00::/7", "fe80::/10", "ff00::/8")
-GUARD_IMAGE = "hermes-rewind-netguard:1"
+GUARD_IMAGE = "hermes-rewind-netguard:2"  # bump when the Dockerfile or its base changes
 _GUARD_OK = "REWIND_GUARD_OK"
 _GUARD_DOCKERFILE = (
     f"FROM {DEFAULT_IMAGE}\n"
@@ -283,6 +287,7 @@ class RewindEnvironment:
                 raise
             # This Docker can't apply cgroup limits (e.g. an unprivileged LXC host).
             self._limits = []
+            audit.log("limits_unavailable", task_id=self.task_id, error=str(exc)[:200])
             self._note += ("[rewind] warning: this Docker can't apply CPU/memory/process limits, "
                            "so the sandbox runs without them.\n")
             self._run_container(image, "none" if mode == "none" else "bridge")
@@ -294,6 +299,8 @@ class RewindEnvironment:
                 # Fail closed: a sandbox that can reach this computer is worse than one with no network.
                 self._docker("rm", "-f", self.container, timeout=60, check=False)
                 self._run_container(image, "none")
+                audit.log("network_guard_failed", task_id=self.task_id, error=str(exc)[:200],
+                          fallback="no network")
                 self._note += (
                     "[rewind] warning: couldn't firewall the sandbox's network, so it has no network "
                     f"this time ({str(exc)[:200]}). Set REWIND_NETWORK=full to allow unrestricted access.\n"
@@ -411,6 +418,8 @@ class RewindEnvironment:
         self.cwd = cwd if cwd.startswith("/") else self.cwd
         self._cwd_from_restore = True  # the resumed directory wins over Hermes's default once
         age = time.time() - float(record.get("parked_at") or record.get("updated_at") or time.time())
+        audit.log("resumed", task_id=self.task_id, snapshots=len(self.snapshots), parked_seconds=int(age),
+                  recovered_from_crash=record.get("image", "").endswith(":recovered"))
         self._note = (
             f"[rewind] Resumed this session's sandbox from {_ago(age)} ago with "
             f"{len(self.snapshots)} snapshot(s); earlier changes can still be undone.\n"

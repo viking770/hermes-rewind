@@ -22,6 +22,8 @@ Optional settings (environment variables):
     REWIND_CONFIRM_EXPORT set to 0 to stop asking before the agent exports files
     REWIND_CONFIRM_IRREVERSIBLE  set to 0 to stop asking before commands Rewind can't undo
     REWIND_AUTO_GC        set to 0 to stop the automatic cleanup of expired snapshots and leftovers
+    REWIND_MAX_PARKED_GB  disk cap for kept snapshots together; oldest go first (default 20, 0 = none)
+    REWIND_AUDIT          set to 0 to stop writing <state dir>/audit.log
 """
 from __future__ import annotations
 

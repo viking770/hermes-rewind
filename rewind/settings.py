@@ -54,6 +54,14 @@ def export_total_mb() -> int:
     return int(max(0, _float("REWIND_EXPORT_TOTAL_MB", DEFAULT_EXPORT_TOTAL_MB)))
 
 
+DEFAULT_MAX_PARKED_GB = 20
+
+
+def max_parked_bytes() -> int:
+    """Disk cap for parked snapshots together (REWIND_MAX_PARKED_GB, 0 = no cap)."""
+    return int(max(0.0, _float("REWIND_MAX_PARKED_GB", DEFAULT_MAX_PARKED_GB)) * 1024 ** 3)
+
+
 def confirm_export() -> bool:
     """Ask the user before the agent copies files onto this computer (REWIND_CONFIRM_EXPORT)."""
     return os.environ.get("REWIND_CONFIRM_EXPORT", "1") != "0"
