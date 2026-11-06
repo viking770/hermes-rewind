@@ -163,6 +163,44 @@ class NetworkGuardTests(unittest.TestCase):
         self.assertIn("ip6tables -A OUTPUT -d fc00::/7 -j REJECT", script)
         self.assertIn("REWIND_GUARD_OK", script)
 
+    def test_guard_script_blocks_this_computers_own_addresses(self):
+        # A VPS's public address isn't in any private range.
+        script = _guard_script(["8.8.8.8"], ["203.0.113.7", "2001:db8::7", "127.0.0.1", "not-an-ip; rm -rf /"])
+        self.assertIn("iptables -A OUTPUT -d 203.0.113.7/32 -j REJECT", script)
+        self.assertIn("ip6tables -A OUTPUT -d 2001:db8::7/128 -j REJECT", script)
+        self.assertNotIn("127.0.0.1/32", script)
+        self.assertNotIn("rm -rf", script)
+        # DNS still comes first, even when the resolver is one of the host's addresses.
+        self.assertLess(script.index("-d 8.8.8.8 -p udp --dport 53 -j ACCEPT"),
+                        script.index("-d 203.0.113.7/32 -j REJECT"))
+
+    def test_guard_script_blocks_nat64_and_6to4(self):
+        script = _guard_script([])
+        for net in ("64:ff9b::/96", "64:ff9b:1::/48", "2002::/16"):
+            self.assertIn(f"ip6tables -A OUTPUT -d {net} -j REJECT", script)
+
+    def test_guard_script_fails_closed_when_ipv6_is_on_but_unfilterable(self):
+        script = _guard_script([])
+        self.assertIn("/proc/net/if_inet6", script)
+        fail = script.index("cannot filter it'; exit 1")
+        self.assertLess(fail, script.index("echo REWIND_GUARD_OK"))
+        # Each IPv6 rule is its own line, so `set -e` catches any that fails.
+        self.assertNotIn("&& ip6tables", script)
+
+    def test_default_gateway_is_read_from_the_route_table(self):
+        from rewind.environment import _default_gateways
+        table = ("Iface\tDestination\tGateway \tFlags\n"
+                 "eth0\t00000000\t010011AC\t0003\n"     # default via 172.17.0.1
+                 "eth0\t000011AC\t00000000\t0001\n")    # on-link route
+        self.assertEqual(_default_gateways(table), ["172.17.0.1"])
+
+    def test_guard_receives_gateway_and_host_addresses(self):
+        env = env_for(self.fake, network="internet")
+        env._host_addresses = lambda: ["198.51.100.9"]
+        env.execute("ls")
+        guard = [c for c in self.fake.calls if c[1] == "run" and GUARD_IMAGE in c][-1]
+        self.assertIn("-d 198.51.100.9/32 -j REJECT", guard[-1])
+
 
 class ExportSafetyTests(unittest.TestCase):
     """M1: the agent can't quietly write to this computer."""

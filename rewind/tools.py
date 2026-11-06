@@ -118,9 +118,12 @@ def _env(kwargs):
 
     Never "whichever sandbox is running": in a gateway that serves several
     people, that would let one chat's agent undo or read another's work. A
-    sandbox Hermes shares on purpose is allowed, because Hermes's own terminal
-    tool runs this caller's commands in it too."""
-    env = registry.find(kwargs.get("task_id"), kwargs.get("session_id"))
+    sandbox Hermes shares on purpose is allowed only for local chats, the same
+    rule /rewind follows: from a messaging platform, a chat whose own sandbox
+    isn't registered (no command yet, or parked while idle) must not fall
+    through to the local user's shared sandbox."""
+    env = registry.find(kwargs.get("task_id"), kwargs.get("session_id"),
+                        allow_shared=is_local(_surface()))
     if env is None:
         raise RewindError(
             "This session has no Rewind sandbox yet. Run a terminal command first "

@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import ipaddress
 import os
 import posixpath
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import tarfile
 import tempfile
@@ -70,7 +72,10 @@ NETWORK_MODES = ("internet", "none", "full")
 _BLOCKED_V4 = ("0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
                "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15",
                "224.0.0.0/4", "240.0.0.0/4")
-_BLOCKED_V6 = ("::1/128", "::ffff:0:0/96", "fc00::/7", "fe80::/10", "ff00::/8")
+# NAT64 (64:ff9b::/96, 64:ff9b:1::/48) and 6to4 (2002::/16) embed IPv4 addresses,
+# so they could reach the blocked IPv4 ranges through a translator.
+_BLOCKED_V6 = ("::1/128", "::ffff:0:0/96", "64:ff9b::/96", "64:ff9b:1::/48", "2002::/16",
+               "fc00::/7", "fe80::/10", "ff00::/8")
 GUARD_IMAGE = "hermes-rewind-netguard:2"  # bump when the Dockerfile or its base changes
 _GUARD_OK = "REWIND_GUARD_OK"
 _GUARD_DOCKERFILE = (
@@ -80,23 +85,88 @@ _GUARD_DOCKERFILE = (
 )
 
 
-def _guard_script(nameservers: Sequence[str]) -> str:
+def _clean_addresses(addresses: Sequence[str]) -> List[str]:
+    """Valid, specific IP addresses only, deduplicated, in a stable order.
+    Everything here ends up in a shell script, so nothing else gets through."""
+    out: List[str] = []
+    for raw in addresses:
+        try:
+            ip = ipaddress.ip_address(str(raw).split("%", 1)[0].strip())
+        except ValueError:
+            continue
+        if ip.is_unspecified or ip.is_loopback:
+            continue
+        if str(ip) not in out:
+            out.append(str(ip))
+    return out
+
+
+def host_addresses() -> List[str]:
+    """This computer's own addresses, as seen by the plugin process.
+
+    On a server with a public IP, the blocked private ranges don't cover the
+    host itself: a sandbox could reach anything listening on 0.0.0.0 (Hermes's
+    gateway, databases, admin panels) through that public address. Found from
+    the hostname and from the source address the system would use to reach
+    the internet (a UDP connect, which sends no packets)."""
+    found: List[str] = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            found.append(info[4][0])
+    except OSError:
+        pass
+    for family, probe in ((socket.AF_INET, "192.0.2.1"), (socket.AF_INET6, "2001:db8::1")):
+        try:
+            with socket.socket(family, socket.SOCK_DGRAM) as sock:
+                sock.connect((probe, 9))
+                found.append(sock.getsockname()[0])
+        except OSError:
+            pass
+    return _clean_addresses(found)
+
+
+def _guard_script(nameservers: Sequence[str], host_ips: Sequence[str] = ()) -> str:
     """Shell for the guard helper: allow loopback and DNS to the sandbox's own
-    resolvers, reject every blocked range, then confirm the rules are in."""
+    resolvers, reject every blocked range and this computer's own addresses,
+    then confirm the rules are in. Fails (no OK) when the sandbox has IPv6 but
+    it can't be filtered, so the caller starts it with no network instead."""
+    nameservers = _clean_addresses(nameservers)
+    host_ips = _clean_addresses(host_ips)
     v4 = [ns for ns in nameservers if ":" not in ns]
     v6 = [ns for ns in nameservers if ":" in ns]
     lines = ["set -e", "iptables -A OUTPUT -o lo -j ACCEPT"]
     for ns in v4:
         lines += [f"iptables -A OUTPUT -d {ns} -p {p} --dport 53 -j ACCEPT" for p in ("udp", "tcp")]
     lines += [f"iptables -A OUTPUT -d {net} -j REJECT" for net in _BLOCKED_V4]
-    # IPv6 is often disabled in containers; block it when it's there.
+    lines += [f"iptables -A OUTPUT -d {ip}/32 -j REJECT" for ip in host_ips if ":" not in ip]
     v6_rules = ["ip6tables -A OUTPUT -o lo -j ACCEPT"]
     for ns in v6:
         v6_rules += [f"ip6tables -A OUTPUT -d {ns} -p {p} --dport 53 -j ACCEPT" for p in ("udp", "tcp")]
     v6_rules += [f"ip6tables -A OUTPUT -d {net} -j REJECT" for net in _BLOCKED_V6]
-    lines.append("if ip6tables -S OUTPUT >/dev/null 2>&1; then " + " && ".join(v6_rules) + "; fi")
-    lines.append(f"iptables -S OUTPUT | grep -q REJECT && echo {_GUARD_OK}")
+    v6_rules += [f"ip6tables -A OUTPUT -d {ip}/128 -j REJECT" for ip in host_ips if ":" in ip]
+    v6_rules.append("ip6tables -S OUTPUT | grep -q REJECT")
+    # IPv6 is often disabled in containers. When it's on, it must be filtered:
+    # an address on any interface but lo with no ip6tables means fail closed.
+    lines += [
+        "if ip6tables -S OUTPUT >/dev/null 2>&1; then",
+        # One rule per line, so `set -e` stops at any that fails (in an && list it wouldn't).
+        *("  " + rule for rule in v6_rules),
+        "elif [ -r /proc/net/if_inet6 ] && grep -qv ' lo$' /proc/net/if_inet6; then",
+        "  echo 'IPv6 is enabled in the sandbox but ip6tables cannot filter it'; exit 1",
+        "fi",
+        f"iptables -S OUTPUT | grep -q REJECT && echo {_GUARD_OK}",
+    ]
     return "\n".join(lines)
+
+
+def _default_gateways(route_table: str) -> List[str]:
+    """IPv4 default gateways from the text of /proc/net/route (hex, little-endian)."""
+    found = []
+    for line in route_table.splitlines()[1:]:
+        cols = line.split()
+        if len(cols) > 2 and cols[1] == "00000000" and re.fullmatch(r"[0-9A-Fa-f]{8}", cols[2]):
+            found.append(socket.inet_ntoa(bytes.fromhex(cols[2])[::-1]))
+    return [g for g in found if g != "0.0.0.0"]
 # overlay2 refuses images deeper than ~125 layers. Each compaction adds one,
 # so stop compacting well before that and let snapshots grow instead.
 MAX_LAYERS = 100
@@ -260,6 +330,7 @@ class RewindEnvironment:
         self.export_total_mb = export_total_mb
         self.last_export_removed: List[str] = []
         self._tar_reader = _popen_tar_reader  # tests swap in a fake
+        self._host_addresses = host_addresses  # tests swap in a fake
         self._note = ""  # said once, with the next command's output
         self.last_restore_changes: Optional[dict] = None
         if store is not None:
@@ -345,10 +416,14 @@ class RewindEnvironment:
         servers = [line.split()[1] for line in resolv.splitlines()
                    if line.startswith("nameserver") and len(line.split()) > 1
                    and re.fullmatch(r"[0-9a-fA-F:.]+", line.split()[1])]
+        # This computer as the sandbox sees it: its gateway (usually the host's
+        # side of the Docker network), plus the host's own addresses.
+        _, routes = self._docker("exec", self.container, "cat", "/proc/net/route", timeout=30, check=False)
+        host_ips = _default_gateways(routes) + self._host_addresses()
         code, out = self._docker(
             "run", "--rm", "--network", f"container:{self.container}",
             "--cap-drop", "ALL", "--cap-add", "NET_ADMIN", "--entrypoint", "sh", GUARD_IMAGE,
-            "-c", _guard_script(servers), timeout=120, check=False,
+            "-c", _guard_script(servers, host_ips), timeout=120, check=False,
         )
         if code != 0 or _GUARD_OK not in out:
             raise RewindError(f"network rules failed (exit {code}): {out.strip()[-300:]}")
@@ -472,11 +547,22 @@ class RewindEnvironment:
                     stdin_file = self._stage_stdin(stdin_data)
                 except (RewindError, subprocess.TimeoutExpired, OSError) as exc:
                     return _result(f"[rewind] could not pass stdin to the command: {exc}", 1)
-            argv = [self.docker_bin, "exec", self.container, self._shell, "-c", _wrap(command, cwd, stdin_file)]
+            pid_file = f"/tmp/.rewind-pid-{uuid.uuid4().hex[:12]}"
+            argv = [self.docker_bin, "exec", self.container, self._shell, "-c",
+                    _wrap(command, cwd, stdin_file, pid_file)]
+            stopped = True
             try:
                 code, out = self._run(argv, limit)
             except subprocess.TimeoutExpired as exc:
-                code, out = 124, _decode(exc.output) + f"\n[rewind] command timed out after {limit}s"
+                # Abandoning the client doesn't stop the command: `docker exec`
+                # leaves it running in the container, still changing files.
+                stopped = self._kill_command(pid_file, stdin_file)
+                code, out = 124, _decode(exc.output) + f"\n[rewind] command timed out after {limit}s" + (
+                    " and was stopped." if stopped else
+                    "; it could not be stopped and may still be running in the sandbox, so no snapshot "
+                    "was taken of this state."
+                )
+                audit.log("command_timeout", task_id=self.task_id, seconds=limit, stopped=stopped)
 
             output, new_cwd = _split_cwd(out)
             if new_cwd:
@@ -484,9 +570,21 @@ class RewindEnvironment:
             # The state after this command is the state before the next one,
             # so capture it now, while the agent reads this output and decides
             # what to do. A read-only command leaves the pending snapshot valid.
-            if self._pending is None:
+            # Never while a timed-out command may still be changing files: that
+            # snapshot would hold a half-finished state labelled as a clean one.
+            if self._pending is None and stopped:
                 self._start_background()
             return _result(note + output + after, code, new_cwd)
+
+    def _kill_command(self, pid_file: str, stdin_file: Optional[str] = None) -> bool:
+        """Stop a timed-out command and everything it started. True when
+        nothing of it is left running."""
+        try:
+            code, out = self._docker("exec", self.container, "sh", "-c",
+                                     _kill_script(pid_file, stdin_file), timeout=60, check=False)
+        except (RewindError, subprocess.TimeoutExpired, OSError):
+            return False
+        return code == 0 and _KILL_OK in out
 
     def _stage_stdin(self, data: str) -> str:
         """Write ``data`` to a temp file in the sandbox and return its path.
@@ -1022,20 +1120,78 @@ def _result(output: str, code: int, cwd: Optional[str] = None) -> dict:
     return result
 
 
-def _wrap(command: str, cwd: str, stdin_file: Optional[str] = None) -> str:
+def _wrap(command: str, cwd: str, stdin_file: Optional[str] = None, pid_file: Optional[str] = None) -> str:
     """Run ``command`` in ``cwd`` and report the final directory so cd persists.
-    With ``stdin_file``, the command reads it as stdin and it is removed after."""
+    With ``stdin_file``, the command reads it as stdin and it is removed after.
+    With ``pid_file``, the shell's PID is written there while the command runs,
+    so a timed-out command can be found and stopped (see _kill_script)."""
     q = shlex.quote(cwd)
     if stdin_file:
         # A group, not a subshell, so a `cd` inside still carries over.
         command = f"{{\n{command}\n}} < {stdin_file}\n__rewind_rc=$?\nrm -f {stdin_file}\n(exit $__rewind_rc)"
+    start = f"echo $$ > {pid_file}\n" if pid_file else ""
+    end = f"rm -f {pid_file}\n" if pid_file else ""
     return (
-        f"cd {q} 2>/dev/null || {{ mkdir -p {q} && cd {q}; }}\n"
+        start
+        + f"cd {q} 2>/dev/null || {{ mkdir -p {q} && cd {q}; }}\n"
         f"{command}\n"
         "__rewind_rc=$?\n"
-        f"printf '\\n{_CWD_MARKER}%s\\n' \"$(pwd)\"\n"
+        + end
+        + f"printf '\\n{_CWD_MARKER}%s\\n' \"$(pwd)\"\n"
         "exit $__rewind_rc\n"
     )
+
+
+_KILL_OK = "REWIND_KILL_OK"
+
+
+def _kill_script(pid_file: str, stdin_file: Optional[str] = None) -> str:
+    """Shell that stops the command whose shell PID is in ``pid_file``, and
+    every process it started. Plain POSIX sh reading /proc, so it works
+    without procps. ``docker exec`` makes the command's shell a session and
+    process-group leader, so its processes are found by session and group
+    (which catches ones that double-forked and were reparented to PID 1) and
+    by parent PID (which catches ones that called setsid). They are frozen,
+    so they can't fork or move away, found again, then killed. Prints
+    _KILL_OK once none of them is left running."""
+    leftovers = f" {stdin_file} {stdin_file}.b64" if stdin_file else ""
+    return "\n".join([
+        f"f={pid_file}",
+        f'[ -f "$f" ] || {{ rm -f{leftovers}; echo {_KILL_OK}; exit 0; }}',
+        'read -r root < "$f"',
+        'case "$root" in ""|*[!0-9]*) exit 1;; esac',
+        # /proc/PID/stat is "pid (comm) state ppid pgrp session ...": comm can
+        # hold spaces, so everything up to the last ") " is dropped first.
+        "tree() {",
+        '  all=" $root "; more=1',
+        '  while [ "$more" = 1 ]; do more=0',
+        "    for d in /proc/[0-9]*; do",
+        "      p=${d#/proc/}",
+        '      case "$all" in *" $p "*) continue;; esac',
+        '      { read -r s < "$d/stat"; } 2>/dev/null || continue',
+        '      set -- ${s##*) }',
+        '      if [ "$4" = "$root" ] || [ "$3" = "$root" ]; then all="$all$p "; more=1; continue; fi',
+        '      case "$all" in *" $2 "*) all="$all$p "; more=1;; esac',
+        "    done",
+        "  done",
+        '  echo $all',
+        "}",
+        "alive() {",
+        "  for p in $1; do",
+        '    { read -r s < "/proc/$p/stat"; } 2>/dev/null || continue',
+        '    set -- ${s##*) }',
+        '    [ "$1" != Z ] && return 0',
+        "  done",
+        "  return 1",
+        "}",
+        "pids=$(tree); kill -STOP $pids 2>/dev/null",
+        "pids=$(tree); kill -KILL $pids 2>/dev/null",
+        "for i in 1 2 3 4 5 6 7 8 9 10; do",
+        '  alive "$pids" || { rm -f "$f"' + leftovers + f"; echo {_KILL_OK}; exit 0; }}",
+        "  kill -KILL $pids 2>/dev/null; sleep 1",  # whole seconds: not every sleep takes fractions
+        "done",
+        "exit 1",
+    ])
 
 
 def _split_cwd(out: str) -> Tuple[str, Optional[str]]:
