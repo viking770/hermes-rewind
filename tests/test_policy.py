@@ -29,6 +29,14 @@ class PolicyTests(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertFalse(is_mutating(cmd))
 
+    def test_read_only_programs_with_options_that_run_programs(self):
+        # These options make a read-only program run another program, which can change anything.
+        for cmd in ("rg --pre ./x.sh foo", "rg --pre=./x.sh foo .", "sort --compress-program=./x.sh big.txt",
+                    "sort --compress-program ./x.sh big.txt"):
+            self.assertTrue(is_mutating(cmd), cmd)
+        for cmd in ("rg foo", "rg --pretty foo", "rg --pre-glob '*.gz' foo", "sort -n f", "sort -u f"):
+            self.assertFalse(is_mutating(cmd), cmd)
+
     def test_mutating_commands(self):
         for cmd in [
             "rm -rf build",

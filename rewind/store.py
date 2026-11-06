@@ -142,7 +142,11 @@ def is_valid_record(record: dict) -> bool:
         if image not in (None, "") and not (own_image(image) or image == base):
             return False
         container = record.get("container")
-        if container is not None and not (isinstance(container, str) and CONTAINER_RE.fullmatch(container)):
+        # A sandbox's container is named after its own repository
+        # (hermes-rewind/<name> -> hermes-rewind-<name>), so a record can't name
+        # another chat's container for Rewind to commit or remove.
+        if container is not None and not (isinstance(container, str) and CONTAINER_RE.fullmatch(container)
+                                          and container == "hermes-rewind-" + repo.split("/", 1)[1]):
             return False
         snapshots = record.get("snapshots", [])
         if not isinstance(snapshots, list) or not all(

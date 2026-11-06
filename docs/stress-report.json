@@ -1,27 +1,27 @@
 {
-  "date": "2026-11-06 15:24 UTC",
+  "date": "2026-11-06 16:29 UTC",
   "rewind": "0.2.4",
-  "commit": "77e8176",
+  "commit": "35e6bcc",
   "docker": "29.9.1 (linux/amd64)",
   "host": "Windows 11",
   "python": "3.14.9",
-  "seconds": 235.9,
-  "passed": 120,
-  "total": 120,
+  "seconds": 243.1,
+  "passed": 121,
+  "total": 121,
   "section_seconds": {
-    "hardening": 16.9,
-    "network": 36.7,
-    "evasion": 15.3,
-    "undo": 65.3,
-    "stdin": 6.2,
-    "timeout": 14.4,
-    "compaction": 19.1,
-    "export": 6.7,
-    "isolation": 10.6,
+    "hardening": 17.5,
+    "network": 40.7,
+    "evasion": 16.9,
+    "undo": 59.5,
+    "stdin": 6.4,
+    "timeout": 14.1,
+    "compaction": 20.0,
+    "export": 7.3,
+    "isolation": 10.9,
     "approval": 0.1,
-    "parking": 24.0,
-    "audit": 11.0,
-    "cleanup": 10.0
+    "parking": 23.2,
+    "audit": 16.1,
+    "cleanup": 10.3
   },
   "results": [
     {
@@ -124,7 +124,7 @@
       "section": "network",
       "check": "DNS works",
       "ok": true,
-      "evidence": "example.com resolves to 104.20.23.154"
+      "evidence": "example.com resolves to 172.66.147.243"
     },
     {
       "section": "network",
@@ -137,6 +137,12 @@
       "check": "cloud metadata 169.254.169.254 blocked",
       "ok": true,
       "evidence": "connect 169.254.169.254:80 -> connection refused"
+    },
+    {
+      "section": "network",
+      "check": "Azure platform address 168.63.129.16 (WireServer) blocked",
+      "ok": true,
+      "evidence": "connect 168.63.129.16:80 -> connection refused"
     },
     {
       "section": "network",
@@ -304,13 +310,13 @@
       "section": "undo",
       "check": "rm -rf of the working directory took effect (not recreated)",
       "ok": true,
-      "evidence": "after rm -rf /workspace/app (the working directory): [rewind] note: /workspace/app no longer exists, so this ran in /workspace."
+      "evidence": "after rm -rf /workspace/app (the working directory): gone"
     },
     {
       "section": "undo",
       "check": "says the working directory is gone and runs in /workspace",
       "ok": true,
-      "evidence": "gone / pwd=/workspace"
+      "evidence": "[rewind] note: /workspace/app no longer exists, so this ran in /workspace. / pwd=/workspace"
     },
     {
       "section": "undo",
@@ -388,7 +394,7 @@
       "section": "timeout",
       "check": "returns soon after the limit",
       "ok": true,
-      "evidence": "4 s limit: returned after 7.6s with exit 124"
+      "evidence": "4 s limit: returned after 7.7s with exit 124"
     },
     {
       "section": "timeout",
@@ -460,7 +466,7 @@
       "section": "export",
       "check": "a second export never overwrites the first",
       "ok": true,
-      "evidence": "first: …/20261106-205353, second: …/20261106-205354"
+      "evidence": "first: …/20261106-215830, second: …/20261106-215830_2"
     },
     {
       "section": "export",

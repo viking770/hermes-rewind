@@ -567,6 +567,17 @@ class RewindEnvironment:
         record = self._store.load(self.task_id)
         if not record or store_mod.is_expired(record):
             return
+        # A record may resume from its own snapshots, or from a base image this
+        # sandbox would use anyway, never from an image it names itself: an edited
+        # record must not be able to start the sandbox from an arbitrary image.
+        allowed_bases = {self.base_image, TOOLS_IMAGE, SLIM_IMAGE}
+        if record.get("base_image") not in allowed_bases:
+            audit.log("record_ignored", task_id=self.task_id, reason="base image not allowed",
+                      base_image=str(record.get("base_image"))[:120])
+            return
+        own = f"{record['repository']}:"
+        if record.get("image") and not (str(record["image"]).startswith(own) or record["image"] in allowed_bases):
+            return
         if record.get("status") == "live":
             if record.get("host") != store_mod.hostname() or store_mod.pid_alive(record.get("owner_pid")):
                 return  # another live process owns it
@@ -642,6 +653,9 @@ class RewindEnvironment:
             if stdin_data is not None:
                 try:
                     stdin_file = self._stage_stdin(stdin_data)
+                except UnicodeError as exc:  # text that can't be UTF-8, e.g. a lone surrogate
+                    return _result(f"[rewind] could not pass stdin to the command: it is not valid text "
+                                   f"({type(exc).__name__} at position {getattr(exc, 'start', '?')})", 1)
                 except (RewindError, subprocess.TimeoutExpired, OSError) as exc:
                     return _result(f"[rewind] could not pass stdin to the command: {exc}", 1)
             pid_file = f"/tmp/.rewind-pid-{uuid.uuid4().hex[:12]}"

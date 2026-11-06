@@ -17,10 +17,15 @@ _PATTERNS = [
     (re.compile(r"(?i)(\bauthorization\s*:\s*(?:bearer|basic|token|digest)?\s*)[^\s'\"\\]+"), r"\1" + MASK),
     (re.compile(r"(?i)(\b(?:x-api-key|api-key|x-auth-token|private-token|x-access-token|cookie|"
                 r"proxy-authorization)\s*:\s*)[^'\"\\\n]+"), r"\1" + MASK),
-    # Credentials in URLs: https://user:secret@host
-    (re.compile(r"(\b[a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s:@'\"]+:[^/\s@'\"]+@"), r"\1" + MASK + "@"),
-    # curl -u user:pass / --user user:pass
-    (re.compile(r"((?:^|\s)(?:-u|--user)(?:\s+|=)['\"]?)[^\s'\"]+"), r"\1" + MASK),
+    # Credentials in URLs: https://user:secret@host. The password may itself hold an
+    # "@", so everything up to the last "@" before the path is masked.
+    (re.compile(r"(\b[a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s:@'\"]+:[^/\s'\"]+@"), r"\1" + MASK + "@"),
+    # curl -u user:pass / --user user:pass / -uuser:pass (attached, so only with a colon)
+    (re.compile(r"((?:^|\s)(?:-u|--user)(?:\s+|=)['\"]?)[^\s'\":]+:[^\s'\"]+"), r"\1" + MASK),
+    (re.compile(r"((?:^|\s)-u)[^\s'\":]+:[^\s'\"]+"), r"\1" + MASK),
+    # JSON bodies: {"password": "..."}, also with the \" quoting used inside shell strings.
+    (re.compile(r"(?i)(\\?\"(?:password|passwd|pass|secret|token|api_?key|access_?token|refresh_?token|"
+                r"client_?secret|private_?key|auth)\\?\"\s*:\s*\\?\")(?:[^\"\\]|\\(?!\"))*"), r"\1" + MASK),
     # NAME=value where the name says it's a secret.
     (re.compile(r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|PASS|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|"
                 r"CREDENTIALS?|AUTH)[A-Z0-9_]*=)(?:'[^']*'|\"[^\"]*\"|[^\s;&|]+)"), r"\1" + MASK),
@@ -35,6 +40,8 @@ _PATTERNS = [
     (re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b"), MASK),
     (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b"), MASK),
     (re.compile(r"\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}\b"), MASK),
+    (re.compile(r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b"), MASK),  # Stripe secret / restricted
+    (re.compile(r"\bwhsec_[A-Za-z0-9]{16,}\b"), MASK),  # webhook signing secrets
     (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), MASK),
     (re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), MASK),
     (re.compile(r"\bhf_[A-Za-z0-9]{20,}\b"), MASK),

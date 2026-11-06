@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -82,10 +83,19 @@ def tail(count: int = 50) -> Iterator[dict]:
             continue
 
 
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _printable(text: str) -> str:
+    """Control characters as visible escapes (\\x1b...). Entries hold agent-written
+    text, and `hermes rewind log` prints to a terminal that would act on them."""
+    return _CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", str(text))
+
+
 def describe(entry: dict) -> str:
     """One readable line for ``hermes rewind log``."""
     skip = {"ts", "time", "event", "via", "task_id", "pid"}
     details = ", ".join(f"{k}={v}" for k, v in entry.items() if k not in skip and v not in (None, "", []))
     task = entry.get("task_id") or "-"
-    return f"{entry.get('time', '?')}  {entry.get('event', '?'):<18} via {entry.get('via', '?'):<8} {task}" + (
-        f"  {details}" if details else "")
+    return _printable(f"{entry.get('time', '?')}  {entry.get('event', '?'):<18} via {entry.get('via', '?'):<8} {task}"
+                      + (f"  {details}" if details else ""))

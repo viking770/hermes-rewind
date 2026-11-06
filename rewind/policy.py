@@ -123,8 +123,10 @@ def _words_mutate(words: list) -> bool:
                    for a in args)
     if program == "find" and any(a in _FIND_WRITES for a in args):
         return True
-    if program == "sort" and any(a == "-o" or a.startswith("--output") for a in args):
-        return True
+    if program == "sort" and any(a == "-o" or a.startswith(("--output", "--compress-program")) for a in args):
+        return True  # writes a file, or runs a (de)compression program
+    if program == "rg" and any(a == "--pre" or a.startswith("--pre=") for a in args):
+        return True  # runs a preprocessor program on every file
     if program == "tree" and any(a == "-o" for a in args):
         return True
     if program in _OUTPUT_FILE_ARG and len([a for a in args if not a.startswith("-")]) >= 2:

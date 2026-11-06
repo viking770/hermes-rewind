@@ -124,21 +124,21 @@ class RedactionTests(unittest.TestCase):
         self.assertNotIn("abc123", redact("export GH_TOKEN=abc123"))
         self.assertNotIn("s3cret", redact("git clone https://u:s3cret@host/r"))
 
-    @unittest.expectedFailure  # QA-06: curl -uUSER:PASS (no space) is valid curl syntax
+    # Was QA-06 (fixed): curl -uUSER:PASS (no space) is valid curl syntax
     def test_curl_attached_user(self):
         self.assertNotIn("hunter2", redact("curl -uadmin:hunter2 https://x"))
 
-    @unittest.expectedFailure  # QA-06: JSON bodies with a password key
+    # Was QA-06 (fixed): JSON bodies with a password key
     def test_json_password(self):
         self.assertNotIn("hunter2", redact("curl -d '{\"password\":\"hunter2\"}' https://x"))
 
-    @unittest.expectedFailure  # QA-06: Stripe secret keys use sk_live_ (underscore)
+    # Was QA-06 (fixed): Stripe secret keys use sk_live_ (underscore)
     def test_stripe_key(self):
         # Built at run time so the source holds no key-shaped literal (secret scanners flag those).
         fake_key = "sk_" + "live_" + "abcdefghijklmnopqrstuvwx1234"
         self.assertNotIn("abcdefghijklmnopqrstuvwx1234", redact(f"run {fake_key}"))
 
-    @unittest.expectedFailure  # QA-06: a password containing @ leaks its tail
+    # Was QA-06 (fixed): a password containing @ leaks its tail
     def test_url_password_with_at(self):
         self.assertNotIn("ss@", redact("git clone https://u:p@ss@host/r"))
 
@@ -198,7 +198,7 @@ class RecordTamperingTests(unittest.TestCase):
     def test_foreign_repository_rejected(self):
         self.assertFalse(is_valid_record({"task_id": "t", "status": "parked", "repository": "evil/x"}))
 
-    @unittest.expectedFailure  # QA-04: base_image == image lets a record pick any local image
+    # Was QA-04 (fixed): base_image == image lets a record pick any local image
     def test_record_cannot_choose_arbitrary_image(self):
         self._write({"task_id": "Demo Task", "status": "parked", "repository": "hermes-rewind/demo-task-abc123",
                      "base_image": "attacker/evil:1", "image": "attacker/evil:1", "snapshots": [
@@ -212,7 +212,7 @@ class RecordTamperingTests(unittest.TestCase):
         runs = [c for c in fake.calls if c[1] == "run"]
         self.assertFalse(any("attacker/evil:1" in c for c in runs), runs)
 
-    @unittest.expectedFailure  # QA-04: a record's container is not tied to its own repository
+    # Was QA-04 (fixed): a record's container is not tied to its own repository
     def test_record_cannot_remove_another_sandboxes_container(self):
         other = "hermes-rewind-bob-zzz999"
         self._write({"task_id": "Demo Task", "status": "live", "repository": "hermes-rewind/demo-task-abc123",
@@ -280,7 +280,7 @@ class SnapshotEdgeTests(unittest.TestCase):
         ids = [s.id for s in env.snapshots]
         self.assertEqual(len(ids), len(set(ids)))
 
-    @unittest.expectedFailure  # QA-08: a lone surrogate in stdin escapes execute() as UnicodeEncodeError
+    # Was QA-08 (fixed): a lone surrogate in stdin escapes execute() as UnicodeEncodeError
     def test_bad_stdin_does_not_raise(self):
         env = make_env(self.fake)
         result = env.execute("cat", stdin_data="\ud800")
@@ -360,7 +360,7 @@ class ExtractTests(unittest.TestCase):
 
 # -------------------------------------------------------------------- audit
 class AuditTests(unittest.TestCase):
-    @unittest.expectedFailure  # QA-10: control characters from agent text reach the terminal via `hermes rewind log`
+    # Was QA-10 (fixed): control characters from agent text reach the terminal via `hermes rewind log`
     def test_describe_strips_control_characters(self):
         line = audit.describe({"time": "t", "event": "approval_requested", "via": "agent",
                                "command": "ls \x1b[2K\x1b[1A hidden"})

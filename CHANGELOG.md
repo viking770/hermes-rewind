@@ -35,6 +35,20 @@ release; `git log c6e8b71..` lists every change.
 - **The working-directory marker is random per command.** Output that
   contains a marker, or an unterminated heredoc, can no longer set a bogus
   working directory or lose undo history at the next restart.
+- **Tampered parked records can't steer Docker.** A record's container must be
+  its own (it is named after the record's repository), and a sandbox resumes
+  only from its own snapshots or an allowed base image. Before, someone who
+  could write the state folder could make a record start any local image, or
+  commit and remove another chat's container.
+- **More secrets are masked** in snapshot history and the audit log:
+  `curl -uuser:pass`, password, token and secret fields in JSON bodies, Stripe
+  `sk_`/`rk_` keys and `whsec_` webhook secrets, and URL passwords that contain
+  `@`. `-u` values without a `user:password` shape (`sort -u file`) are no
+  longer masked by mistake.
+- **`hermes rewind log` shows control characters as `\x1b`-style escapes**, so
+  agent-written text can't send codes to your terminal.
+- **`rg --pre` and `sort --compress-program` get a snapshot first**, since both
+  run another program.
 
 ### Fixed
 - **Undo could lose a write.** If a command that wrote files was mistaken for
@@ -57,6 +71,8 @@ release; `git log c6e8b71..` lists every change.
   after 1 s and is cached.
 - **A failed sandbox start could hide its real error behind "name already in
   use"** when it retried without resource limits.
+- **Stdin that isn't valid text** (a lone surrogate character) now gives a
+  clear error instead of raising an exception into Hermes.
 
 ### Changed
 - **The default sandbox image includes `git` and `curl`.** It is
@@ -72,26 +88,28 @@ release; `git log c6e8b71..` lists every change.
 ### Testing
 - CI on every push: unit tests on Linux for Python 3.11 to 3.14 and on Windows
   and macOS; Docker integration tests; and the stress test.
-- `scripts/stress_test.py`: 120 attacks on every protection against real
+- `scripts/stress_test.py`: 121 attacks on every protection against real
   Docker, with a report of what the sandbox did each time
   ([docs/stress-report.md](docs/stress-report.md)).
 - `tests/test_qa_logic.py` and `scripts/qa_stress.py`: an independent
   adversarial pass with 41 unit tests and 19 Docker probes.
 
 ### Known issues
-Tracked as `expectedFailure` tests in `tests/test_qa_logic.py` (one per issue)
-and as `BUG(...)` results in `scripts/qa_stress.py`. All are Low or documented:
+Tracked as `expectedFailure` tests in `tests/test_qa_logic.py` and as
+`BUG(...)` results in `scripts/qa_stress.py` where noted. All are Low or
+documented:
 - A process that both leaves the command's session and is orphaned, or a
-  command that deletes Rewind's tracking file in `/tmp`, can survive a timeout.
-- Someone who can already write Rewind's state folder can make a parked record
-  start another local image, or remove another chat's container.
-- Some secrets aren't masked: `curl -uuser:pw`, JSON password fields, Stripe
-  `sk_live_` keys, and a URL password containing `@`.
-- Restore points are not pruned. Command output has no size cap.
-- Exports have no file-count cap.
-- Stdin with a lone surrogate character raises an error.
-- Terminal escape codes in commands reach `hermes rewind log`.
-- A command that ends with `exit` leaves small temporary files.
+  command that deletes Rewind's tracking file in `/tmp`, can survive a timeout
+  (documented in the README; `qa_stress.py`).
+- Restore points are not pruned (`test_qa_logic.py`). Command output has no
+  size cap (`qa_stress.py`).
+- Exports have no file-count cap (`test_qa_logic.py`). Exported files keep
+  group/other read bits, carry no Mark-of-the-Web on Windows, and a file
+  skipped because Windows can't store its name is reported as a link or
+  special file.
+- A command that ends with `exit` leaves small temporary files that end up in
+  snapshots (`qa_stress.py`).
+- A running sandbox has no disk-size limit.
 
 ## 0.2.3
 
