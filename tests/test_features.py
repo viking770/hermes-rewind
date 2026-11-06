@@ -419,6 +419,14 @@ class IrreversibleTests(unittest.TestCase):
 
 
 class VersionTests(unittest.TestCase):
+    def test_plugin_readme_mirrors_the_repo_readme(self):
+        # The catalog page renders the README from the entry's subdir (rewind/) at the
+        # pinned commit, so rewind/README.md must be the same as the repo's README.
+        root = Path(version.__file__).parent.parent
+        self.assertEqual((root / "rewind" / "README.md").read_text(encoding="utf-8"),
+                         (root / "README.md").read_text(encoding="utf-8"),
+                         "Copy README.md to rewind/README.md after editing it.")
+
     def test_manifest_matches_code(self):
         manifest = (Path(version.__file__).parent / "plugin.yaml").read_text(encoding="utf-8")
         self.assertEqual(version.disk_version(), version.VERSION)
