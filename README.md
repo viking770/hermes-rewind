@@ -1,5 +1,7 @@
 # Rewind: an undo button for your agent's terminal
 
+[![tests](https://github.com/viking770/hermes-rewind/actions/workflows/tests.yml/badge.svg)](https://github.com/viking770/hermes-rewind/actions/workflows/tests.yml)
+
 Rewind is a [Hermes Agent](https://hermes-agent.nousresearch.com) terminal backend. It runs every command in a Docker sandbox and **snapshots the sandbox before any command that can change files**. If the agent deletes the wrong folder, breaks a dependency or ruins a refactor, you or the agent can roll back in one step.
 
 ```
