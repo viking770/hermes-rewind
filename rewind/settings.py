@@ -11,7 +11,7 @@ from .environment import (
 )
 
 # Set once this process has created a Rewind sandbox, i.e. Rewind is the
-# terminal backend here. Hermes also exports TERMINAL_ENV in some setups.
+# terminal backend here.
 _backend_used = False
 
 
@@ -20,8 +20,35 @@ def mark_backend_used() -> None:
     _backend_used = True
 
 
+def _raw_hermes_config() -> dict:
+    """Hermes's config.yaml as written (cached by Hermes), or {} outside Hermes."""
+    try:
+        from hermes_cli import config as hermes_config
+        reader = getattr(hermes_config, "read_raw_config_readonly", None) or hermes_config.read_raw_config
+        raw = reader()
+    except Exception:
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def configured_backend() -> str:
+    """The terminal backend Hermes will use, decided the way its terminal tool
+    decides it: terminal.backend written in config.yaml wins, else TERMINAL_ENV.
+
+    Hermes copies config.yaml into TERMINAL_ENV lazily, inside the terminal
+    tool, which runs *after* the pre_tool_call hook. So TERMINAL_ENV alone is
+    often still unset for the first command of a process (say, right after
+    `hermes gateway restart`), and that command would skip the approval."""
+    terminal = _raw_hermes_config().get("terminal")
+    if isinstance(terminal, dict):
+        value = terminal.get("backend") or terminal.get("env_type")  # env_type: Hermes's legacy key
+        if value:
+            return str(value).strip().lower()
+    return os.environ.get("TERMINAL_ENV", "").strip().lower()
+
+
 def backend_active() -> bool:
-    return _backend_used or os.environ.get("TERMINAL_ENV", "").strip().lower() == "rewind"
+    return _backend_used or configured_backend() == "rewind"
 
 
 def _float(name: str, default: float) -> float:

@@ -1,5 +1,6 @@
 """Tests for 0.2.0: parking, cleanup, restore summaries, export, sizes,
 irreversible commands, version checks and the /rewind command."""
+import contextlib
 import json
 import os
 import re
@@ -355,6 +356,66 @@ class IrreversibleTests(unittest.TestCase):
             self.assertIsNone(hook(tool_name="terminal", args={"command": "git push"}))
         finally:
             del os.environ["REWIND_CONFIRM_IRREVERSIBLE"]
+
+    @contextlib.contextmanager
+    def fresh_process(self, raw_config=None, terminal_env=None):
+        """A process where no sandbox exists yet (right after `hermes gateway restart`),
+        with Hermes's config.yaml as given (None: not running inside Hermes)."""
+        import sys
+        import types
+        from rewind import settings
+        saved_used, settings._backend_used = settings._backend_used, False
+        saved_env = os.environ.pop("TERMINAL_ENV", None)
+        saved_modules = {k: sys.modules.get(k) for k in ("hermes_cli", "hermes_cli.config")}
+        if terminal_env is not None:
+            os.environ["TERMINAL_ENV"] = terminal_env
+        if raw_config is not None:
+            config = types.ModuleType("hermes_cli.config")
+            config.read_raw_config_readonly = lambda: raw_config
+            package = types.ModuleType("hermes_cli")
+            package.config = config
+            sys.modules.update({"hermes_cli": package, "hermes_cli.config": config})
+        else:
+            sys.modules["hermes_cli"] = None  # import fails, as outside Hermes
+            sys.modules.pop("hermes_cli.config", None)
+        try:
+            yield
+        finally:
+            settings._backend_used = saved_used
+            os.environ.pop("TERMINAL_ENV", None)
+            if saved_env is not None:
+                os.environ["TERMINAL_ENV"] = saved_env
+            for name, module in saved_modules.items():
+                if module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
+
+    def test_hook_asks_on_the_first_command_after_a_restart(self):
+        # Hermes runs pre_tool_call before its terminal tool copies config.yaml into
+        # TERMINAL_ENV, so the hook must read terminal.backend itself.
+        with self.fresh_process({"terminal": {"backend": "rewind"}}):
+            result = tools.pre_tool_call(tool_name="terminal", args={"command": "git push origin main"})
+            self.assertEqual(result["action"], "approve")
+        with self.fresh_process({"terminal": {"env_type": "rewind"}}):  # Hermes's legacy key
+            self.assertIsNotNone(tools.pre_tool_call(tool_name="terminal", args={"command": "git push"}))
+
+    def test_backend_decided_like_hermes_decides_it(self):
+        from rewind import settings
+        # config.yaml's terminal.backend beats a stale TERMINAL_ENV, as in Hermes.
+        with self.fresh_process({"terminal": {"backend": "docker"}}, terminal_env="rewind"):
+            self.assertFalse(settings.backend_active())
+            self.assertIsNone(tools.pre_tool_call(tool_name="terminal", args={"command": "git push"}))
+        # No backend in config.yaml: TERMINAL_ENV decides.
+        with self.fresh_process({"model": "x"}, terminal_env="rewind"):
+            self.assertTrue(settings.backend_active())
+        with self.fresh_process({}):
+            self.assertFalse(settings.backend_active())
+        # Outside Hermes (no hermes_cli): TERMINAL_ENV only.
+        with self.fresh_process(None, terminal_env="rewind"):
+            self.assertTrue(settings.backend_active())
+        with self.fresh_process(None):
+            self.assertFalse(settings.backend_active())
 
 
 class VersionTests(unittest.TestCase):
