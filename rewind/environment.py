@@ -79,9 +79,11 @@ _LIMIT_ERROR = re.compile(r"cgroup|NanoCPUs|pids|memory limit|Minimum memory|cpu
 NETWORK_MODES = ("internet", "none", "full")
 # Destinations the sandbox may not reach in "internet" mode: this computer
 # (Docker Desktop's host.docker.internal is 192.168.65.254), the LAN, carrier
-# NAT, link-local and cloud metadata (169.254.169.254), multicast, reserved.
-_BLOCKED_V4 = ("0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
-               "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15",
+# NAT, link-local and cloud metadata (169.254.169.254), multicast, reserved, and
+# Azure's platform address 168.63.129.16 (WireServer: VM configuration on port 80,
+# and the default DNS resolver on Azure VMs, so not in any private range).
+_BLOCKED_V4 = ("0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "168.63.129.16/32",
+               "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15",
                "224.0.0.0/4", "240.0.0.0/4")
 # NAT64 (64:ff9b::/96, 64:ff9b:1::/48) and 6to4 (2002::/16) embed IPv4 addresses,
 # so they could reach the blocked IPv4 ranges through a translator.
@@ -174,13 +176,18 @@ def _guard_script(nameservers: Sequence[str], host_ips: Sequence[str] = ()) -> s
     v4 = [ns for ns in nameservers if ":" not in ns]
     v6 = [ns for ns in nameservers if ":" in ns]
     lines = ["set -e", "iptables -A OUTPUT -o lo -j ACCEPT"]
+    # A resolver is reachable for DNS only, wherever it is: on cloud VMs it can be a
+    # platform address that serves more than DNS (Azure's 168.63.129.16 serves the
+    # VM's configuration on port 80), and it may sit outside every blocked range.
     for ns in v4:
         lines += [f"iptables -A OUTPUT -d {ns} -p {p} --dport 53 -j ACCEPT" for p in ("udp", "tcp")]
+        lines.append(f"iptables -A OUTPUT -d {ns} -j REJECT")
     lines += [f"iptables -A OUTPUT -d {net} -j REJECT" for net in _BLOCKED_V4]
     lines += [f"iptables -A OUTPUT -d {ip}/32 -j REJECT" for ip in host_ips if ":" not in ip]
     v6_rules = ["ip6tables -A OUTPUT -o lo -j ACCEPT"]
     for ns in v6:
         v6_rules += [f"ip6tables -A OUTPUT -d {ns} -p {p} --dport 53 -j ACCEPT" for p in ("udp", "tcp")]
+        v6_rules.append(f"ip6tables -A OUTPUT -d {ns} -j REJECT")
     v6_rules += [f"ip6tables -A OUTPUT -d {net} -j REJECT" for net in _BLOCKED_V6]
     v6_rules += [f"ip6tables -A OUTPUT -d {ip}/128 -j REJECT" for ip in host_ips if ":" in ip]
     v6_rules.append("ip6tables -S OUTPUT | grep -q REJECT")

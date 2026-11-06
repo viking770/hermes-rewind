@@ -197,7 +197,9 @@ def section_network():
     if gateway:
         gw = ".".join(str(int(gateway[i:i + 2], 16)) for i in (6, 4, 2, 0))
         check(f"sandbox gateway {gw} blocked", *try_connect(env, gw, 80))
-    targets = [("cloud metadata 169.254.169.254", "169.254.169.254", 80), ("LAN 10.0.0.1", "10.0.0.1", 22),
+    targets = [("cloud metadata 169.254.169.254", "169.254.169.254", 80),
+               ("Azure platform address 168.63.129.16 (WireServer)", "168.63.129.16", 80),
+               ("LAN 10.0.0.1", "10.0.0.1", 22),
                ("LAN 192.168.0.1", "192.168.0.1", 80), ("LAN 172.16.0.1", "172.16.0.1", 80),
                ("carrier NAT 100.64.0.1", "100.64.0.1", 80)]
     for addr in host_addresses():

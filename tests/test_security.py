@@ -174,6 +174,18 @@ class NetworkGuardTests(unittest.TestCase):
         self.assertLess(script.index("-d 8.8.8.8 -p udp --dport 53 -j ACCEPT"),
                         script.index("-d 203.0.113.7/32 -j REJECT"))
 
+    def test_resolver_is_reachable_for_dns_only_wherever_it_is(self):
+        # On Azure VMs the resolver is 168.63.129.16, a public address that also
+        # serves the VM's configuration (WireServer) on port 80.
+        script = _guard_script(["168.63.129.16", "8.8.8.8"])
+        lines = script.splitlines()
+        for ns in ("168.63.129.16", "8.8.8.8"):
+            allow = lines.index(f"iptables -A OUTPUT -d {ns} -p udp --dport 53 -j ACCEPT")
+            self.assertEqual(lines[allow + 1], f"iptables -A OUTPUT -d {ns} -p tcp --dport 53 -j ACCEPT")
+            self.assertEqual(lines[allow + 2], f"iptables -A OUTPUT -d {ns} -j REJECT")  # nothing else
+        self.assertIn("-d 168.63.129.16/32 -j REJECT", script)  # blocked even when it isn't the resolver
+        self.assertIn("ip6tables -A OUTPUT -d fd00::53 -j REJECT", _guard_script(["fd00::53"]))
+
     def test_guard_script_blocks_nat64_and_6to4(self):
         script = _guard_script([])
         for net in ("64:ff9b::/96", "64:ff9b:1::/48", "2002::/16"):

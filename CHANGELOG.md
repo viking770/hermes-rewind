@@ -20,6 +20,12 @@ release; `git log c6e8b71..` lists every change.
   blocks the sandbox's gateway and this computer's own addresses, including a
   server's public IPv4 and IPv6 addresses. It blocks NAT64 and 6to4, and gives
   the sandbox no network when it has IPv6 that can't be filtered.
+- **The DNS resolver is reachable for DNS only, wherever it is.** On Azure VMs,
+  where GitHub Actions and many Hermes gateways run, the resolver is
+  `168.63.129.16`. That address also serves the VM's platform configuration
+  (WireServer) on port 80, and it isn't in any private range, so before this
+  change a sandbox there could reach it. Only port 53 to the resolver is
+  allowed now, and `168.63.129.16` is blocked outright.
 - **Approval before irreversible commands works from the first command on.**
   Before, the first command of a process, for example right after
   `hermes gateway restart`, could `git push` without asking.
