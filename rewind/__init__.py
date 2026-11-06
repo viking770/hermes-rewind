@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
+import sys
 import threading
 import time
 
@@ -46,6 +48,24 @@ from .environment import (
     DEFAULT_MAX_SNAPSHOTS,
     RewindEnvironment,
 )
+
+
+def _docker_daemon() -> tuple:
+    """(running, detail) for `hermes doctor`: the docker CLI can be installed while
+    Docker Desktop or the daemon is stopped, and then every command would fail."""
+    try:
+        proc = subprocess.run(["docker", "version", "--format", "{{.Server.Version}}"],
+                              capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        return False, "(no answer within 10 s: is Docker Desktop starting or stuck?)"
+    except OSError as exc:
+        return False, f"(could not run docker: {exc})"
+    version_text = proc.stdout.strip()
+    if proc.returncode == 0 and version_text:
+        return True, f"(running, version {version_text})"
+    hint = "start Docker Desktop" if sys.platform in ("win32", "darwin") else "start the Docker service"
+    reason = (proc.stderr.strip().splitlines() or ["no server version"])[-1][:160]
+    return False, f"(not reachable: {reason}. {hint.capitalize()} and run `hermes doctor` again)"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -91,11 +111,15 @@ class RewindProvider(TerminalEnvironmentProvider):
     def doctor_checks(self) -> list:
         ok = self.is_available()
         status = version.status()
-        return [
+        checks = [
             (ok, "Rewind backend", "(docker found)" if ok else "(docker CLI not found on PATH)"),
-            (not status["stale"], f"Rewind {status['version']} loaded",
-             f"({status['warning']})" if status["stale"] else "(matches the files on disk)"),
         ]
+        if ok:
+            running, detail = _docker_daemon()
+            checks.append((running, "Docker daemon", detail))
+        checks.append((not status["stale"], f"Rewind {status['version']} loaded",
+                       f"({status['warning']})" if status["stale"] else "(matches the files on disk)"))
+        return checks
 
     def create_environment(self, *, cwd, timeout, task_id="default", image=None, container_config=None, **kwargs):
         settings.mark_backend_used()

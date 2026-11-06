@@ -1,25 +1,26 @@
 # Rewind stress test report
 
-**99/99 checks passed** in 162s. All checks passed.
+**120/120 checks passed** in 236s. All checks passed.
 
-Rewind 0.2.4 (commit `df1f6e5`) · Docker 29.9.1 (linux/amd64) · Windows 11 · Python 3.14.9 · 2026-11-06 14:05 UTC
+Rewind 0.2.4 (commit `77e8176`) · Docker 29.9.1 (linux/amd64) · Windows 11 · Python 3.14.9 · 2026-11-06 15:24 UTC
 
 Every check runs real commands in real Docker sandboxes and records what the sandbox actually did. Produced by [`scripts/stress_test.py`](../scripts/stress_test.py).
 
 | Section | What it attacks | Passed | Time |
 |---|---|---|---|
-| ✅ [hardening](#hardening) | Container hardening: capabilities, privileges, limits, nothing from the host. | 14/14 | 16s |
-| ✅ [network](#network) | Network guard: internet yes, this computer / LAN / metadata no. | 16/16 | 30s |
-| ✅ [undo](#undo) | Snapshots, undo, restore, undo of undo, preview, history limits. | 13/13 | 46s |
-| ✅ [stdin](#stdin) | Hermes's file tools send contents on stdin: must arrive byte-exact. | 1/1 | 5s |
-| ✅ [timeout](#timeout) | A command that times out is stopped, with everything it started. | 4/4 | 11s |
-| ✅ [compaction](#compaction) | Big changes don't make every later snapshot store them again. | 2/2 | 14s |
-| ✅ [export](#export) | Exports bring only plain files onto this computer. | 9/9 | 5s |
-| ✅ [isolation](#isolation) | Each chat reaches only its own sandbox. | 10/10 | 7s |
-| ✅ [approval](#approval) | Commands Rewind can't undo need the user's approval first. | 18/18 | 0s |
-| ✅ [parking](#parking) | Undo history survives Hermes shutting an idle sandbox down. | 6/6 | 16s |
-| ✅ [audit](#audit) | The audit log records what happened, with secrets masked. | 5/5 | 8s |
-| ✅ [cleanup](#cleanup) | Every container and image the run created is removed. | 1/1 | 5s |
+| ✅ [hardening](#hardening) | Container hardening: capabilities, privileges, limits, nothing from the host. | 14/14 | 17s |
+| ✅ [network](#network) | Network guard: internet yes, this computer / LAN / metadata no. | 16/16 | 37s |
+| ✅ [evasion](#evasion) | Firewall evasion: disguised addresses, DNS tricks, IPv6 mapping, UDP, tampering. | 16/16 | 15s |
+| ✅ [undo](#undo) | Snapshots, undo, restore, undo of undo, preview, history limits. | 13/13 | 65s |
+| ✅ [stdin](#stdin) | Hermes's file tools send contents on stdin: must arrive byte-exact. | 1/1 | 6s |
+| ✅ [timeout](#timeout) | A command that times out is stopped, with everything it started. | 4/4 | 14s |
+| ✅ [compaction](#compaction) | Big changes don't make every later snapshot store them again. | 2/2 | 19s |
+| ✅ [export](#export) | Exports bring only plain files onto this computer. | 9/9 | 7s |
+| ✅ [isolation](#isolation) | Each chat reaches only its own sandbox. | 10/10 | 11s |
+| ✅ [approval](#approval) | Commands Rewind can't undo need the user's approval first. | 23/23 | 0s |
+| ✅ [parking](#parking) | Undo history survives Hermes shutting an idle sandbox down. | 6/6 | 24s |
+| ✅ [audit](#audit) | The audit log records what happened, with secrets masked. | 5/5 | 11s |
+| ✅ [cleanup](#cleanup) | Every container and image the run created is removed. | 1/1 | 10s |
 
 ## hardening
 
@@ -46,7 +47,7 @@ Every check runs real commands in real Docker sandboxes and records what the san
 |---|---|---|
 | ✅ | guard installed (no fallback warning) | first command printed: up |
 | ✅ | internet reachable (HTTPS) | GET https://example.com -> 200 |
-| ✅ | DNS works | example.com resolves to 172.66.147.243 |
+| ✅ | DNS works | example.com resolves to 104.20.23.154 |
 | ✅ | sandbox gateway 172.17.0.1 blocked | connect 172.17.0.1:80 -> connection refused |
 | ✅ | cloud metadata 169.254.169.254 blocked | connect 169.254.169.254:80 -> connection refused |
 | ✅ | LAN 10.0.0.1 blocked | connect 10.0.0.1:22 -> connection refused |
@@ -60,6 +61,27 @@ Every check runs real commands in real Docker sandboxes and records what the san
 | ✅ | NAT64 to 10.0.0.1 blocked | connect 64:ff9b::a00:1:80 -> network unreachable |
 | ✅ | IPv6 ULA fd00::1 blocked | connect fd00::1:80 -> network unreachable |
 | ✅ | network=none has no internet | connect 1.1.1.1:443 -> network unreachable |
+
+## evasion
+
+| | Check | What happened |
+|---|---|---|
+| ✅ | this computer as one decimal number blocked | resolved to own address #1: refused or unreachable (errno 111) |
+| ✅ | this computer in hex blocked | resolved to own address #1: refused or unreachable (errno 111) |
+| ✅ | this computer in octal blocked | resolved to own address #1: refused or unreachable (errno 111) |
+| ✅ | this computer in short form (a.b.cd) blocked | resolved to own address #1: refused or unreachable (errno 111) |
+| ✅ | cloud metadata as decimal (2852039166) blocked | resolved to 169.254.169.254: refused or unreachable (errno 111) |
+| ✅ | cloud metadata in hex (0xa9fea9fe) blocked | resolved to 169.254.169.254: refused or unreachable (errno 111) |
+| ✅ | this computer as IPv4-mapped IPv6 blocked | resolved to ::ffff:own address #1: refused or unreachable (errno 111) |
+| ✅ | cloud metadata as IPv4-mapped IPv6 blocked | resolved to ::ffff:169.254.169.254: refused or unreachable (errno 111) |
+| ✅ | DNS name resolving to cloud metadata (nip.io) blocked | resolved to 169.254.169.254: refused or unreachable (errno 111) |
+| ✅ | DNS name resolving to this computer (nip.io) blocked | resolved to own address #1: refused or unreachable (errno 111) |
+| ✅ | 0.0.0.0 blocked | resolved to 0.0.0.0: refused or unreachable (errno 111) |
+| ✅ | UDP to this computer blocked | blocked: Operation not permitted |
+| ✅ | DNS resolver reachable only on port 53 | connect 192.168.65.7:80 -> connection refused |
+| ✅ | can't create a private network namespace to escape the rules | unshare: unshare failed: Operation not permitted |
+| ✅ | no firewall tools inside the sandbox | iptables/nft/ip6tables absent |
+| ✅ | can't open raw packet sockets (no hand-built packets) | refused: Operation not permitted |
 
 ## undo
 
@@ -89,7 +111,7 @@ Every check runs real commands in real Docker sandboxes and records what the san
 
 | | Check | What happened |
 |---|---|---|
-| ✅ | returns soon after the limit | 4 s limit: returned after 6.1s with exit 124 |
+| ✅ | returns soon after the limit | 4 s limit: returned after 7.6s with exit 124 |
 | ✅ | reports that it was stopped | [rewind] command timed out after 4s and was stopped. |
 | ✅ | detached, setsid and nohup children are all killed | `(sleep 301 &); setsid sleep 302 & nohup sleep 303 >/dev/null 2>&1 & sleep 304`: 0 of its sleep processes left running |
 | ✅ | sandbox still works and can undo after a timeout | after undo, /workspace/w: missing |
@@ -111,7 +133,7 @@ Every check runs real commands in real Docker sandboxes and records what the san
 | ✅ | FIFOs are not created | pipe is in the skipped list |
 | ✅ | setuid bit dropped | sandbox mode 4755 -> exported mode 666 |
 | ✅ | nothing lands outside the export folder | every exported path is under the export folder |
-| ✅ | a second export never overwrites the first | first: …/20261106-193438, second: …/20261106-193439 |
+| ✅ | a second export never overwrites the first | first: …/20261106-205353, second: …/20261106-205354 |
 | ✅ | export over the size cap is refused | /workspace/huge is 3 MB, over the 2 MB export limit (REWIND_EXPORT_MAX_MB). |
 | ✅ | export of a missing path is refused | /workspace/does-not-exist does not exist in the sandbox. |
 
@@ -139,6 +161,11 @@ Every check runs real commands in real Docker sandboxes and records what the san
 | ✅ | asks before: docker push me/img | Rewind can't undo this: `docker push` changes a remote service. Snapshots only cover the sandbox's files. Run it? |
 | ✅ | asks before: curl -X POST https://x.io/hook -d @f | Rewind can't undo this: `curl` sends an HTTP POST request. Snapshots only cover the sandbox's files. Run it? |
 | ✅ | asks before: bash -c 'git push' | Rewind can't undo this: `git push` sends commits outside the sandbox. Snapshots only cover the sandbox's files. Run it? |
+| ✅ | asks before: bash -lc 'git push origin main' | Rewind can't undo this: `git push` sends commits outside the sandbox. Snapshots only cover the sandbox's files. Run it? |
+| ✅ | asks before: echo $(git push) | Rewind can't undo this: `git push` sends commits outside the sandbox. Snapshots only cover the sandbox's files. Run it? |
+| ✅ | asks before: sudo -u bob git push | Rewind can't undo this: `git push` sends commits outside the sandbox. Snapshots only cover the sandbox's files. Run it? |
+| ✅ | asks before: env -i git push | Rewind can't undo this: `git push` sends commits outside the sandbox. Snapshots only cover the sandbox's files. Run it? |
+| ✅ | asks before: curl -sSXPOST https://x.io/hook | Rewind can't undo this: `curl` sends an HTTP POST request. Snapshots only cover the sandbox's files. Run it? |
 | ✅ | asks before: eval "git push" | Rewind can't undo this: `git push` sends commits outside the sandbox. Snapshots only cover the sandbox's files. Run it? |
 | ✅ | asks before: git -C repo push | Rewind can't undo this: `git push` sends commits outside the sandbox. Snapshots only cover the sandbox's files. Run it? |
 | ✅ | asks before: kubectl apply -f k.yaml | Rewind can't undo this: `kubectl apply` changes a cluster outside the sandbox. Snapshots only cover the sandbox's files. Run it? |
@@ -168,9 +195,9 @@ Every check runs real commands in real Docker sandboxes and records what the san
 
 | | Check | What happened |
 |---|---|---|
-| ✅ | audit log has 'undo' events | 1 of 19 entries |
-| ✅ | audit log has 'approval_requested' events | 13 of 19 entries |
-| ✅ | audit log has 'command_timeout' events | 2 of 19 entries |
+| ✅ | audit log has 'undo' events | 1 of 24 entries |
+| ✅ | audit log has 'approval_requested' events | 18 of 24 entries |
+| ✅ | audit log has 'command_timeout' events | 2 of 24 entries |
 | ✅ | the approval request itself is logged | approval_requested written for the git push |
 | ✅ | secrets are masked in the audit log | logged command: TOKEN=[REDACTED] git push |
 

@@ -175,6 +175,11 @@ def _irreversible(command: str, depth: int) -> Optional[str]:
     match = _SCRIPT_SENDS.search(command)
     if match:
         return f"a script calls `{match.group(0).rstrip('(')}`, which sends data outside the sandbox"
+    # Command substitution runs its contents too: echo $(git push), `git push`.
+    for inner in _SUBSTITUTION.findall(command):
+        reason = _irreversible(next(part for part in inner if part), depth + 1)
+        if reason:
+            return reason
     for segment in _split_commands(_REDIRECT.sub(" ", command)):
         segment = segment.strip().lstrip("({!").rstrip(")}").strip()
         if not segment:
@@ -237,6 +242,17 @@ _RUNNERS = {
     "stdbuf": {"-i", "-o", "-e"}, "unbuffer": set(), "doas": {"-u"}, "chroot": set(),
 }
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash", "fish"})
+# `-c` alone or inside a cluster of short options: -c, -lc, -ec, -xec.
+_SHELL_C = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
+_SUBSTITUTION = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
+# Prefixes that run the rest of the line, and their options that take a value.
+_PREFIX_VALUE_OPTS = {
+    "sudo": {"-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T", "-U", "--user", "--group", "--host", "--prompt"},
+    "doas": {"-u", "-C"},
+    "env": {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"},
+}
+# curl short options that take a value, so the rest of a cluster is that value.
+_CURL_VALUE_LETTERS = set("HoeuAbcxmwKErYyzCUQ")
 # git options that come before the subcommand and take a value: git -C repo push.
 _GIT_VALUE_OPTS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"})
 
@@ -254,16 +270,49 @@ def _git_subcommand(args: list) -> str:
     return ""
 
 
+def _strip_prefixes(words: list, depth: int):
+    """Drop NAME=value, wrappers and sudo/doas/env with their options. Returns
+    (words, reason): reason is set when `env -S 'cmd'` hides a command in a string."""
+    while words:
+        word = words[0]
+        if _ASSIGNMENT.match(word) or word in _WRAPPERS:
+            words = words[1:]
+            continue
+        if word in _PREFIX_VALUE_OPTS:
+            takes_value, words = _PREFIX_VALUE_OPTS[word], words[1:]
+            while words and words[0].startswith("-") and words[0] != "--":
+                opt, words = words[0], words[1:]
+                if opt in ("-S", "--split-string") and words:
+                    return [], _irreversible(words[0], depth + 1)
+                if opt in takes_value and words:
+                    words = words[1:]
+            if words and words[0] == "--":
+                words = words[1:]
+            continue
+        break
+    return words, None
+
+
 def _words_irreversible(words: list, depth: int = 0) -> Optional[str]:
-    while words and (_ASSIGNMENT.match(words[0]) or words[0] in _WRAPPERS or words[0] in ("sudo", "env")):
-        words = words[1:]
-    if not words:
-        return None
+    words, hidden = _strip_prefixes(words, depth)
+    if hidden or not words:
+        return hidden
     program = words[0].rsplit("/", 1)[-1]
     args = words[1:]
-    # A command hidden inside another: bash -c '...', eval ..., xargs git push, timeout 5 curl ...
-    if program in _SHELLS and "-c" in args[:-1]:
-        return _irreversible(args[args.index("-c") + 1], depth + 1)
+    # A command hidden inside another: bash -c '...', bash -lc '...', eval ..., xargs git push, ...
+    if program in _SHELLS:
+        i = 0
+        while i < len(args) - 1:
+            arg = args[i]
+            if _SHELL_C.fullmatch(arg):
+                return _irreversible(args[i + 1], depth + 1)
+            if arg in ("-o", "+o", "-O", "+O"):  # bash -o pipefail -c '...'
+                i += 2
+            elif arg.startswith(("-", "+")) and arg != "--":
+                i += 1
+            else:
+                break  # a script file, not -c
+        return None
     if program == "eval":
         return _irreversible(" ".join(args), depth + 1)
     if program in _RUNNERS:
@@ -316,6 +365,20 @@ def _http_method(program: str, args: list) -> Optional[str]:
             return arg.partition("=")[2].upper()
         if arg.startswith("-X") and len(arg) > 2:
             return arg[2:].upper()
+        if program == "curl" and arg.startswith("-") and not arg.startswith("--") and len(arg) > 2:
+            # A cluster of short options: -sSXPOST, -sd x, -d@file, -sT file.
+            for pos, letter in enumerate(arg[1:], 1):
+                if letter == "X":
+                    value = arg[pos + 1:] or (args[i + 1] if i + 1 < len(args) else "")
+                    return value.upper()
+                if letter in "dF":
+                    return "POST"
+                if letter == "T":
+                    return "PUT"
+                if letter in _CURL_VALUE_LETTERS:
+                    break  # the rest of the cluster is this option's value
+    if program == "curl" and any(a in ("-T", "--upload-file") or a.startswith("--upload-file=") for a in args):
+        return "PUT"
     if program == "curl" and any(a in _CURL_DATA or a.startswith(tuple(f"{d}=" for d in _CURL_DATA))
                                  for a in args):
         return "POST"

@@ -1,26 +1,27 @@
 {
-  "date": "2026-11-06 14:05 UTC",
+  "date": "2026-11-06 15:24 UTC",
   "rewind": "0.2.4",
-  "commit": "df1f6e5",
+  "commit": "77e8176",
   "docker": "29.9.1 (linux/amd64)",
   "host": "Windows 11",
   "python": "3.14.9",
-  "seconds": 162.5,
-  "passed": 99,
-  "total": 99,
+  "seconds": 235.9,
+  "passed": 120,
+  "total": 120,
   "section_seconds": {
-    "hardening": 15.7,
-    "network": 30.3,
-    "undo": 45.6,
-    "stdin": 5.0,
-    "timeout": 10.7,
-    "compaction": 14.0,
-    "export": 5.0,
-    "isolation": 7.5,
+    "hardening": 16.9,
+    "network": 36.7,
+    "evasion": 15.3,
+    "undo": 65.3,
+    "stdin": 6.2,
+    "timeout": 14.4,
+    "compaction": 19.1,
+    "export": 6.7,
+    "isolation": 10.6,
     "approval": 0.1,
-    "parking": 15.6,
-    "audit": 8.0,
-    "cleanup": 5.2
+    "parking": 24.0,
+    "audit": 11.0,
+    "cleanup": 10.0
   },
   "results": [
     {
@@ -123,7 +124,7 @@
       "section": "network",
       "check": "DNS works",
       "ok": true,
-      "evidence": "example.com resolves to 172.66.147.243"
+      "evidence": "example.com resolves to 104.20.23.154"
     },
     {
       "section": "network",
@@ -202,6 +203,102 @@
       "check": "network=none has no internet",
       "ok": true,
       "evidence": "connect 1.1.1.1:443 -> network unreachable"
+    },
+    {
+      "section": "evasion",
+      "check": "this computer as one decimal number blocked",
+      "ok": true,
+      "evidence": "resolved to own address #1: refused or unreachable (errno 111)"
+    },
+    {
+      "section": "evasion",
+      "check": "this computer in hex blocked",
+      "ok": true,
+      "evidence": "resolved to own address #1: refused or unreachable (errno 111)"
+    },
+    {
+      "section": "evasion",
+      "check": "this computer in octal blocked",
+      "ok": true,
+      "evidence": "resolved to own address #1: refused or unreachable (errno 111)"
+    },
+    {
+      "section": "evasion",
+      "check": "this computer in short form (a.b.cd) blocked",
+      "ok": true,
+      "evidence": "resolved to own address #1: refused or unreachable (errno 111)"
+    },
+    {
+      "section": "evasion",
+      "check": "cloud metadata as decimal (2852039166) blocked",
+      "ok": true,
+      "evidence": "resolved to 169.254.169.254: refused or unreachable (errno 111)"
+    },
+    {
+      "section": "evasion",
+      "check": "cloud metadata in hex (0xa9fea9fe) blocked",
+      "ok": true,
+      "evidence": "resolved to 169.254.169.254: refused or unreachable (errno 111)"
+    },
+    {
+      "section": "evasion",
+      "check": "this computer as IPv4-mapped IPv6 blocked",
+      "ok": true,
+      "evidence": "resolved to ::ffff:own address #1: refused or unreachable (errno 111)"
+    },
+    {
+      "section": "evasion",
+      "check": "cloud metadata as IPv4-mapped IPv6 blocked",
+      "ok": true,
+      "evidence": "resolved to ::ffff:169.254.169.254: refused or unreachable (errno 111)"
+    },
+    {
+      "section": "evasion",
+      "check": "DNS name resolving to cloud metadata (nip.io) blocked",
+      "ok": true,
+      "evidence": "resolved to 169.254.169.254: refused or unreachable (errno 111)"
+    },
+    {
+      "section": "evasion",
+      "check": "DNS name resolving to this computer (nip.io) blocked",
+      "ok": true,
+      "evidence": "resolved to own address #1: refused or unreachable (errno 111)"
+    },
+    {
+      "section": "evasion",
+      "check": "0.0.0.0 blocked",
+      "ok": true,
+      "evidence": "resolved to 0.0.0.0: refused or unreachable (errno 111)"
+    },
+    {
+      "section": "evasion",
+      "check": "UDP to this computer blocked",
+      "ok": true,
+      "evidence": "blocked: Operation not permitted"
+    },
+    {
+      "section": "evasion",
+      "check": "DNS resolver reachable only on port 53",
+      "ok": true,
+      "evidence": "connect 192.168.65.7:80 -> connection refused"
+    },
+    {
+      "section": "evasion",
+      "check": "can't create a private network namespace to escape the rules",
+      "ok": true,
+      "evidence": "unshare: unshare failed: Operation not permitted"
+    },
+    {
+      "section": "evasion",
+      "check": "no firewall tools inside the sandbox",
+      "ok": true,
+      "evidence": "iptables/nft/ip6tables absent"
+    },
+    {
+      "section": "evasion",
+      "check": "can't open raw packet sockets (no hand-built packets)",
+      "ok": true,
+      "evidence": "refused: Operation not permitted"
     },
     {
       "section": "undo",
@@ -291,7 +388,7 @@
       "section": "timeout",
       "check": "returns soon after the limit",
       "ok": true,
-      "evidence": "4 s limit: returned after 6.1s with exit 124"
+      "evidence": "4 s limit: returned after 7.6s with exit 124"
     },
     {
       "section": "timeout",
@@ -363,7 +460,7 @@
       "section": "export",
       "check": "a second export never overwrites the first",
       "ok": true,
-      "evidence": "first: …/20261106-193438, second: …/20261106-193439"
+      "evidence": "first: …/20261106-205353, second: …/20261106-205354"
     },
     {
       "section": "export",
@@ -466,6 +563,36 @@
       "check": "asks before: bash -c 'git push'",
       "ok": true,
       "evidence": "Rewind can't undo this: `git push` sends commits outside the sandbox. Snapshots only cover the sandbox's files. Run it?"
+    },
+    {
+      "section": "approval",
+      "check": "asks before: bash -lc 'git push origin main'",
+      "ok": true,
+      "evidence": "Rewind can't undo this: `git push` sends commits outside the sandbox. Snapshots only cover the sandbox's files. Run it?"
+    },
+    {
+      "section": "approval",
+      "check": "asks before: echo $(git push)",
+      "ok": true,
+      "evidence": "Rewind can't undo this: `git push` sends commits outside the sandbox. Snapshots only cover the sandbox's files. Run it?"
+    },
+    {
+      "section": "approval",
+      "check": "asks before: sudo -u bob git push",
+      "ok": true,
+      "evidence": "Rewind can't undo this: `git push` sends commits outside the sandbox. Snapshots only cover the sandbox's files. Run it?"
+    },
+    {
+      "section": "approval",
+      "check": "asks before: env -i git push",
+      "ok": true,
+      "evidence": "Rewind can't undo this: `git push` sends commits outside the sandbox. Snapshots only cover the sandbox's files. Run it?"
+    },
+    {
+      "section": "approval",
+      "check": "asks before: curl -sSXPOST https://x.io/hook",
+      "ok": true,
+      "evidence": "Rewind can't undo this: `curl` sends an HTTP POST request. Snapshots only cover the sandbox's files. Run it?"
     },
     {
       "section": "approval",
@@ -585,19 +712,19 @@
       "section": "audit",
       "check": "audit log has 'undo' events",
       "ok": true,
-      "evidence": "1 of 19 entries"
+      "evidence": "1 of 24 entries"
     },
     {
       "section": "audit",
       "check": "audit log has 'approval_requested' events",
       "ok": true,
-      "evidence": "13 of 19 entries"
+      "evidence": "18 of 24 entries"
     },
     {
       "section": "audit",
       "check": "audit log has 'command_timeout' events",
       "ok": true,
-      "evidence": "2 of 19 entries"
+      "evidence": "2 of 24 entries"
     },
     {
       "section": "audit",

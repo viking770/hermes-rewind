@@ -625,6 +625,28 @@ class ToolTests(unittest.TestCase):
         for name in tools.SCHEMAS:
             self.assertEqual(registered[name][1], name)
 
+    def test_doctor_reports_a_stopped_docker_daemon(self):
+        # The docker CLI can be installed while Docker Desktop is stopped.
+        from unittest import mock
+        import rewind
+        stopped = subprocess.CompletedProcess([], 1, stdout="", stderr=(
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?\n"))
+        running = subprocess.CompletedProcess([], 0, stdout="29.9.1\n", stderr="")
+        provider = RewindProvider()
+        with mock.patch.object(rewind.shutil, "which", return_value="/usr/bin/docker"):
+            with mock.patch.object(rewind.subprocess, "run", return_value=stopped):
+                checks = {name: (ok, detail) for ok, name, detail in provider.doctor_checks()}
+            self.assertFalse(checks["Docker daemon"][0])
+            self.assertIn("Is the docker daemon running", checks["Docker daemon"][1])
+            with mock.patch.object(rewind.subprocess, "run", side_effect=subprocess.TimeoutExpired("docker", 10)):
+                self.assertFalse(dict((n, ok) for ok, n, _ in provider.doctor_checks())["Docker daemon"])
+            with mock.patch.object(rewind.subprocess, "run", return_value=running):
+                checks = {name: (ok, detail) for ok, name, detail in provider.doctor_checks()}
+            self.assertEqual(checks["Docker daemon"], (True, "(running, version 29.9.1)"))
+        with mock.patch.object(rewind.shutil, "which", return_value=None):
+            names = [name for _, name, _ in provider.doctor_checks()]
+        self.assertNotIn("Docker daemon", names)  # no CLI: the first check already says so
+
     def test_provider_creates_environment(self):
         env = RewindProvider().create_environment(cwd="~", timeout=30, task_id="t1", image="")
         self.assertEqual(env.cwd, "/workspace")

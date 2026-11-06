@@ -222,6 +222,75 @@ def section_network():
     check("network=none has no internet", *try_connect(offline, "1.1.1.1", 443))
 
 
+_RESOLVE_AND_CONNECT = r'''
+import json, socket, sys
+results = {}
+for label, (host, proto) in json.loads(sys.argv[1]).items():
+    try:
+        kind = socket.SOCK_DGRAM if proto == "udp" else socket.SOCK_STREAM
+        family, _, _, _, addr = socket.getaddrinfo(host, 80 if proto == "tcp" else 53, type=kind)[0]
+        s = socket.socket(family, kind)
+        s.settimeout(3)
+        if proto == "udp":
+            s.connect(addr)
+            s.send(b"x")
+            s.recv(16)
+            results[label] = [addr[0], "got a reply"]
+        else:
+            rc = s.connect_ex(addr)
+            results[label] = [addr[0], "connected" if rc == 0 else f"refused or unreachable (errno {rc})"]
+    except socket.gaierror as exc:
+        results[label] = ["", f"name did not resolve ({exc.args[-1]})"]
+    except OSError as exc:
+        results[label] = ["", f"blocked: {exc.strerror or exc}"]
+print(json.dumps(results))
+'''
+
+
+def section_evasion():
+    """Firewall evasion: disguised addresses, DNS tricks, IPv6 mapping, UDP, tampering."""
+    env = sandbox("evasion", network="internet")
+    run(env, "true")
+    lan = next((a for a in host_addresses() if ":" not in a and not a.startswith("127.")), "192.168.1.1")
+    a, b, c, d = map(int, lan.split("."))
+    # The disguised forms of this computer's address are never written to the report.
+    probes = {
+        "this computer as one decimal number": (str((a << 24) + (b << 16) + (c << 8) + d), "tcp"),
+        "this computer in hex": ("0x%02x%02x%02x%02x" % (a, b, c, d), "tcp"),
+        "this computer in octal": (".".join("0%o" % x for x in (a, b, c, d)), "tcp"),
+        "this computer in short form (a.b.cd)": (f"{a}.{b}.{(c << 8) + d}", "tcp"),
+        "cloud metadata as decimal (2852039166)": ("2852039166", "tcp"),
+        "cloud metadata in hex (0xa9fea9fe)": ("0xa9fea9fe", "tcp"),
+        "this computer as IPv4-mapped IPv6": (f"::ffff:{lan}", "tcp"),
+        "cloud metadata as IPv4-mapped IPv6": ("::ffff:169.254.169.254", "tcp"),
+        "DNS name resolving to cloud metadata (nip.io)": ("169.254.169.254.nip.io", "tcp"),
+        "DNS name resolving to this computer (nip.io)": (f"{lan}.nip.io", "tcp"),
+        "0.0.0.0": ("0.0.0.0", "tcp"),
+        "UDP to this computer": (lan, "udp"),
+    }
+    raw = out(env, "python3 - '" + json.dumps(probes) + "'", stdin_data=_RESOLVE_AND_CONNECT)
+    try:
+        results = json.loads(raw.splitlines()[-1])
+    except (ValueError, IndexError):
+        check("evasion probes ran", False, raw[-200:])
+        return
+    for label, (addr, what) in results.items():
+        reached = what in ("connected", "got a reply")
+        shown = f"resolved to {addr}: {what}" if addr else what
+        check(f"{label} blocked", not reached, shown)
+    ns = out(env, "awk '/^nameserver/{print $2; exit}' /etc/resolv.conf")
+    if ns:
+        check(f"DNS resolver reachable only on port 53", *try_connect(env, ns, 80))
+    unshare = out(env, "unshare -n true 2>&1 && echo ALLOWED || echo REFUSED")
+    check("can't create a private network namespace to escape the rules", "ALLOWED" not in unshare,
+          unshare.splitlines()[0][:100])
+    tools_present = out(env, "command -v iptables nft ip6tables 2>/dev/null | tr '\\n' ' '")
+    check("no firewall tools inside the sandbox", not tools_present, tools_present or "iptables/nft/ip6tables absent")
+    packet = out(env, py("import socket\ntry:\n  socket.socket(socket.AF_PACKET, socket.SOCK_RAW)\n  print('ALLOWED')\n"
+                         "except OSError as x:\n  print('refused:', x.strerror)"))
+    check("can't open raw packet sockets (no hand-built packets)", "ALLOWED" not in packet, packet)
+
+
 def section_undo():
     """Snapshots, undo, restore, undo of undo, preview, history limits."""
     env = sandbox("undo", max_snapshots=6)
@@ -431,7 +500,9 @@ def section_approval():
     settings._backend_used = True
     try:
         risky = ["git push origin main", "npm publish", "docker push me/img", "curl -X POST https://x.io/hook -d @f",
-                 "bash -c 'git push'", "eval \"git push\"", "git -C repo push", "kubectl apply -f k.yaml",
+                 "bash -c 'git push'", "bash -lc 'git push origin main'", "echo $(git push)", "sudo -u bob git push",
+                 "env -i git push", "curl -sSXPOST https://x.io/hook", "eval \"git push\"", "git -C repo push",
+                 "kubectl apply -f k.yaml",
                  "ssh prod 'rm -rf /srv'", py("import requests; requests.post('https://x.io', data='a')")]
         for command in risky:
             result = tools.pre_tool_call(tool_name="terminal", args={"command": command}, task_id="stress")
@@ -523,7 +594,7 @@ def section_audit():
 
 
 SECTIONS = {
-    "hardening": section_hardening, "network": section_network, "undo": section_undo,
+    "hardening": section_hardening, "network": section_network, "evasion": section_evasion, "undo": section_undo,
     "stdin": section_stdin, "timeout": section_timeout, "compaction": section_compaction,
     "export": section_export, "isolation": section_isolation, "approval": section_approval,
     "parking": section_parking, "audit": section_audit,

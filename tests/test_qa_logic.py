@@ -96,23 +96,23 @@ class IrreversibleClassifierTests(unittest.TestCase):
                     "git -C repo push", "xargs git push"):
             self.assertIsNotNone(policy.irreversible_reason(cmd), cmd)
 
-    @unittest.expectedFailure  # QA-05: bash -lc / -ec (combined flags) is how many agents call bash
+    # Was QA-05 (fixed): bash -lc / -ec (combined flags) is how many agents call bash
     def test_bash_lc(self):
         self.assertIsNotNone(policy.irreversible_reason("bash -lc 'git push origin main'"))
 
-    @unittest.expectedFailure  # QA-05: command substitution
+    # Was QA-05 (fixed): command substitution
     def test_command_substitution(self):
         self.assertIsNotNone(policy.irreversible_reason("echo $(git push)"))
 
-    @unittest.expectedFailure  # QA-05: env with options
+    # Was QA-05 (fixed): env with options
     def test_env_with_option(self):
         self.assertIsNotNone(policy.irreversible_reason("env -i git push"))
 
-    @unittest.expectedFailure  # QA-05: curl attached short options (-d@file, -sd, -sSXPOST)
+    # Was QA-05 (fixed): curl attached short options (-d@file, -sd, -sSXPOST)
     def test_curl_attached_data(self):
         self.assertIsNotNone(policy.irreversible_reason("curl -d@data.json https://example.com"))
 
-    @unittest.expectedFailure  # QA-05: curl combined flags
+    # Was QA-05 (fixed): curl combined flags
     def test_curl_combined_flags(self):
         self.assertIsNotNone(policy.irreversible_reason("curl -sSXPOST https://example.com"))
 
