@@ -4,7 +4,7 @@ name: rewind
 title: Rewind
 repo: https://github.com/viking770/hermes-rewind
 # Commit with the plugin code under rewind/. Bump it in the PR whenever rewind/ changes.
-sha: f92a30c1e9ba6380d2e209bf7d2838aa67319c65
+sha: d0ddb096a0c679bfde7e5bf950898c3c4eb1b665
 subdir: rewind
 version: "0.2.3"
 description: Undo button for the agent's terminal. A Docker sandbox backend that snapshots before every file-changing command, keeps the history across idle shutdowns, and rolls back with /rewind undo.
