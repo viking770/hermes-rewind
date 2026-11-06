@@ -4,7 +4,8 @@ One JSON object per line in ``<state dir>/audit.log``: when, what (restore,
 undo, export, forget, purge, approval requested, sandbox resumed, network
 guard fell back, ...), for which sandbox, and through what (the agent's tool,
 /rewind, the CLI, or Rewind itself). Text is redacted like snapshot commands.
-The file is owner-only on POSIX and rotates to ``audit.log.1`` at 5 MB.
+The file is owner-only on POSIX and rotates at 5 MB, keeping ``audit.log.1``
+to ``audit.log.3``.
 Set REWIND_AUDIT=0 to turn it off. Writing it never breaks the action itself.
 """
 from __future__ import annotations
@@ -21,6 +22,7 @@ from . import store as store_mod
 from .redact import redact
 
 MAX_BYTES = 5 * 1024 * 1024
+KEEP_ROTATED = 3  # audit.log.1 (newest) to audit.log.3 (oldest)
 _lock = threading.Lock()
 
 
@@ -51,14 +53,16 @@ def log(event: str, *, task_id: Optional[str] = None, via: str = "rewind", **det
     entry = {"ts": round(time.time(), 3), "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
              "event": event, "via": via, "task_id": task_id, "pid": os.getpid()}
     entry.update(_clean(details))
-    line = json.dumps(entry, ensure_ascii=False) + "\n"
+    # ASCII only: otherwise json leaves U+2028/U+2029/U+0085 raw, and agent text
+    # holding them could break an entry apart for anything reading it line by line.
+    line = json.dumps(entry, ensure_ascii=True) + "\n"
     try:
         with _lock:
             target = path()
             target.parent.mkdir(parents=True, exist_ok=True)
             try:
                 if target.stat().st_size + len(line) > MAX_BYTES:
-                    os.replace(target, target.with_name(target.name + ".1"))
+                    _rotate(target)
             except FileNotFoundError:
                 pass
             fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -68,28 +72,61 @@ def log(event: str, *, task_id: Optional[str] = None, via: str = "rewind", **det
         pass
 
 
-def tail(count: int = 50) -> Iterator[dict]:
-    """The last ``count`` events, oldest first (reads the rotated file too if needed)."""
-    lines = []
-    for candidate in (path().with_name("audit.log.1"), path()):
+def _rotated(target: Path, n: int) -> Path:
+    return target.with_name(f"{target.name}.{n}")
+
+
+def _rotate(target: Path) -> None:
+    """audit.log -> .1 -> .2 -> ... -> .KEEP_ROTATED, dropping the oldest. Several
+    generations, so one burst of entries can't push older evidence out at once."""
+    for n in range(KEEP_ROTATED - 1, 0, -1):
         try:
-            lines += candidate.read_text(encoding="utf-8").splitlines()
-        except OSError:
+            os.replace(_rotated(target, n), _rotated(target, n + 1))
+        except FileNotFoundError:
             pass
-    for line in lines[-count:]:
+    os.replace(target, _rotated(target, 1))
+
+
+def tail(count: int = 50) -> Iterator[dict]:
+    """The last ``count`` events, oldest first (reads rotated files too if needed).
+    Lines that aren't a JSON object are skipped."""
+    if count <= 0:
+        return
+    target = path()
+    entries: list = []
+    for candidate in [target] + [_rotated(target, n) for n in range(1, KEEP_ROTATED + 1)]:
         try:
-            yield json.loads(line)
-        except ValueError:
+            text = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
             continue
+        found = []
+        for line in text.split("\n"):  # only "\n" ends an entry, never U+2028 and friends
+            try:
+                value = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(value, dict):
+                found.append(value)
+        entries = found + entries
+        if len(entries) >= count:
+            break
+    yield from entries[-count:]
 
 
-_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# C0/C1 controls, plus characters that hide or reorder text on screen: zero-width
+# characters, bidi marks, overrides and isolates (U+202E can make "evil.exe" read
+# as "exe.live"), line and paragraph separators, and the BOM.
+_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f​-‏ -‮⁠-⁩﻿]")
 
 
 def _printable(text: str) -> str:
-    """Control characters as visible escapes (\\x1b...). Entries hold agent-written
-    text, and `hermes rewind log` prints to a terminal that would act on them."""
-    return _CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", str(text))
+    """Control characters as visible escapes (\\x1b, \\u202e...). Entries hold
+    agent-written text, and `hermes rewind log` prints to a terminal that would
+    act on them."""
+    def escape(match) -> str:
+        code = ord(match.group())
+        return f"\\x{code:02x}" if code < 0x100 else f"\\u{code:04x}"
+    return _CONTROL.sub(escape, str(text))
 
 
 def describe(entry: dict) -> str:

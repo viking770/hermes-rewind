@@ -156,6 +156,10 @@ class ApiRunner:
             return self.cli(argv, timeout)
         except _UseCli:
             return self.cli(argv, timeout)
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            # A response that isn't the JSON Docker documents (a proxy, a broken
+            # daemon). Something may have been done already, so no CLI retry.
+            return 1, f"Docker API returned an unexpected response ({type(exc).__name__}: {str(exc)[:200]})\n"
 
     # The request, response and any streamed body happen on a worker thread so
     # a timeout works the same way on sockets and on Windows named pipes, which

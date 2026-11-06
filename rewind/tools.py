@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shlex
 import shutil
@@ -18,7 +19,9 @@ import subprocess
 import time
 
 from . import audit, policy, registry, settings, store as store_mod, version
-from .environment import RewindError, Snapshot, describe_changes, describe_skipped, subprocess_runner
+from .environment import (
+    RewindError, Snapshot, describe_changes, describe_skipped, export_folders, subprocess_runner,
+)
 
 TOOLSET = "rewind"
 
@@ -138,6 +141,9 @@ def _guard(fn):
             return fn(args or {}, **kwargs)
         except (RewindError, subprocess.TimeoutExpired, OSError) as exc:
             return _err(str(exc))
+        except Exception as exc:  # a tool must answer the agent, never crash Hermes
+            logging.getLogger(__name__).exception("Rewind tool failed")
+            return _err(f"Rewind hit an unexpected error ({type(exc).__name__}: {str(exc)[:200]}).")
     return handler
 
 
@@ -435,9 +441,14 @@ def run_purge(exports: bool = False) -> dict:
     """Delete every parked sandbox now (and, with ``exports``, the export folder)."""
     counts = store_mod.purge(store_mod.Store(settings.state_dir()), subprocess_runner)
     if exports:
+        # Only the per-session folders Rewind's exports created: REWIND_EXPORT_DIR
+        # may point at a shared folder (Downloads, Desktop) that holds other files.
         folder = settings.export_dir()
-        counts["exports_deleted"] = int(folder.is_dir())
-        shutil.rmtree(folder, ignore_errors=True)
+        own_default = not os.environ.get("REWIND_EXPORT_DIR")
+        doomed = export_folders(folder, legacy=own_default)
+        for path in doomed:
+            shutil.rmtree(path, ignore_errors=True)
+        counts["exports_deleted"] = len(doomed)
     audit.log("purge", via="cli", **counts)
     return counts
 
@@ -470,8 +481,8 @@ def _cli_handler(args) -> int:
         if counts["skipped_live"]:
             print(f"Left {counts['skipped_live']} that a running Hermes is using; run again after closing it.")
         if "exports_deleted" in counts:
-            print(f"Deleted the export folder {settings.export_dir()}." if counts["exports_deleted"]
-                  else "There was no export folder.")
+            print(f"Deleted {counts['exports_deleted']} export folder(s) under {settings.export_dir()}."
+                  if counts["exports_deleted"] else "There were no exports to delete.")
     else:
         print(_status_text())
     return 0
@@ -496,14 +507,22 @@ def pre_tool_call(tool_name: str = "", args=None, task_id=None, **_ignored):
                         f"(into {settings.export_dir()}). Allow it?"),
             "rule_key": "rewind-export",
         }
-    if tool_name != "terminal":
+    # The terminal tool, plus any other tool that hands the sandbox a shell command
+    # (`command`) or source code (`code`, e.g. execute_code).
+    command, code = args.get("command"), args.get("code")
+    if tool_name in _COMMAND_TOOLS and isinstance(command, str):
+        code = None
+    elif tool_name in _CODE_TOOLS and isinstance(code, str):
+        command = None
+    else:
         return None
     if not settings.confirm_irreversible() or not settings.network_enabled() or not settings.backend_active():
         return None
-    command = args.get("command")
-    if not isinstance(command, str):
-        return None
-    reason = policy.irreversible_reason(command)
+    if isinstance(command, str):
+        reason = policy.irreversible_reason(command)
+    else:
+        reason = policy.script_irreversible_reason(code)
+        command = code
     if not reason:
         return None
     audit.log("approval_requested", task_id=task_id, via="agent", action=_rule_key(reason), reason=reason,
@@ -515,11 +534,20 @@ def pre_tool_call(tool_name: str = "", args=None, task_id=None, **_ignored):
     }
 
 
+# Tools that run a shell command or source code in the sandbox. Other tools that
+# merely have a "command" argument (read_file, say) are left alone.
+_COMMAND_TOOLS = frozenset({"terminal", "process", "shell", "bash", "run_command", "execute_command"})
+_CODE_TOOLS = frozenset({"execute_code", "run_code", "code_interpreter"})
+
+
 def _rule_key(reason: str) -> str:
     """Approval key per action ("git push", "npm publish"), not per program, so
     allowing one kind of push doesn't silently allow every git or npm write."""
     quoted = reason.split("`")[1] if reason.count("`") >= 2 else "command"
-    words = [w for w in quoted.split() if re.fullmatch(r"[A-Za-z0-9._-]+", w)][:2] or ["command"]
+    # Up to three words: "curl post api.example.com" keeps the host, so allowing one
+    # host's writes always doesn't allow every HTTP write.
+    words = [re.sub(r"[^A-Za-z0-9._-]+", "_", w).strip("_") for w in quoted.split()]
+    words = [w for w in words if w][:3] or ["command"]
     return "rewind-irreversible-" + "-".join(words).lower()
 
 

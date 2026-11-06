@@ -152,6 +152,15 @@ def is_valid_record(record: dict) -> bool:
         if not isinstance(snapshots, list) or not all(
                 isinstance(s, dict) and own_image(s.get("image")) for s in snapshots):
             return False
+        for snap in snapshots:  # field types, so describing a snapshot can't fail later
+            if "created_at" in snap and (not isinstance(snap["created_at"], (int, float))
+                                         or isinstance(snap["created_at"], bool)):
+                return False
+            if "id" in snap and not (isinstance(snap["id"], str) and _TAG_RE.fullmatch(snap["id"])):
+                return False
+            for key in ("label", "command", "cwd", "parent"):
+                if key in snap and not isinstance(snap[key], str):
+                    return False
         dropped = record.get("dropped_images", [])
         if not isinstance(dropped, list) or not all(own_image(i) for i in dropped):
             return False
@@ -242,6 +251,7 @@ def purge(store: Store, run: Runner, *, docker_bin: str = "docker") -> Dict[str,
         container = record.get("container") or ""
         if container:  # a dead owner's container (validated as Rewind's own when read)
             docker("rm", "-f", container, timeout=60)
+            docker("rm", "-f", f"{container}-net", timeout=60)  # its network holder, if any
         _delete_record(store, record, docker)
         counts["purged"] += 1
     return counts
@@ -319,6 +329,7 @@ def reap(store: Store, run: Runner, *, keep_seconds: float, live_repositories: S
                 if code == 0:
                     record["image"] = image
                 docker("rm", "-f", container, timeout=60)
+                docker("rm", "-f", f"{container}-net", timeout=60)
             record.update(status="parked", parked_at=now, expires_at=record.get("updated_at", now) + keep_seconds,
                           owner_pid=None, container=None)
             store.save(record)

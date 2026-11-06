@@ -1,5 +1,71 @@
 # Changelog
 
+## Unreleased
+
+Fixes from a QA and security review of 0.2.4.
+
+### Security
+- **The sandbox never runs on an unfiltered network.** In `internet` mode a
+  holder container from the trusted guard image now owns the network namespace,
+  the rules go in, and only then does the sandbox start inside it
+  (`--network container:<holder>`). Before, the sandbox started on the plain
+  bridge and was firewalled a moment later, so a restored or resumed snapshot
+  whose `/bin/sh` the agent had replaced could reach this computer, the LAN or
+  cloud metadata in that window. DNS servers and routes are now read with the
+  holder's own tools, so the sandbox can't choose which addresses DNS is
+  allowed to.
+- **Windows exports refuse NTFS stream names.** A `:` in any path component
+  (`evil.exe::$DATA`, `x.txt:Zone.Identifier`) or a trailing dot or space is
+  skipped, so an export can't drop the Mark of the Web or forge it.
+- **`hermes rewind purge --exports` deletes only Rewind's export folders**
+  (tagged with a `.hermes-rewind-export` marker), never the whole
+  `REWIND_EXPORT_DIR`, which may be Downloads or Desktop. The export size cap
+  counts only those folders too, and concurrent exports no longer collide.
+- **Audit log:** entries are written as ASCII, so U+2028/U+2029/U+0085 in
+  agent text can no longer split or hide an entry or crash `hermes rewind log`;
+  non-object lines are skipped; bidi and zero-width characters are shown as
+  escapes; three rotated files are kept instead of one.
+- **Redaction** now covers `sshpass -p`, `docker/podman/helm login -p`,
+  `NAME = value` with spaces, `password: …` keys (YAML, INI, Python dicts),
+  secrets in URL query strings (Azure SAS `sig=`, S3 presigned signatures,
+  `?token=`), Telegram bot tokens, and PGP private key blocks.
+
+### Fixes
+- **A crash after resuming a parked sandbox no longer loses its history.** The
+  resumed sandbox's container is named after its repository again, so the live
+  record it writes passes validation and is recovered after a crash.
+- **Undo points stay accurate around commands that look read-only but write:**
+  `git grep -O`/`--open-files-in-pager`, `tree -R`/`-o`, `file -C`,
+  `less -o`/`--log-file` and the `>|` redirect now count as changes, and a
+  background snapshot taken before any `git` command (which repository config
+  can make run programs) is discarded instead of reused.
+- Listing a snapshot's files for a preview runs with the sandbox's hardening flags.
+
+### Lower-severity fixes
+- **The "can't undo" prompt catches more:** `urlopen(url, data)` with data
+  passed positionally, `http.client` POSTs, git aliases that push (`git config
+  alias.p push`, `git -c alias.p=push p`), `python -m twine upload`,
+  `npx`/`uvx`/`pipx run`/`pnpm dlx` tools, `curl --data-ascii`/`--form-string`,
+  `nc`/`ncat`/`socat`/`telnet` (but not `nc -z`), and scripts named like
+  `deploy.sh`/`release.sh`/`publish.sh`. Hermes's code tool (`execute_code`) is
+  checked for network calls and shelled-out commands. Approving an HTTP write
+  "always" now covers that host only (`curl post api.example.com`).
+- **Inbound connections are dropped** in `internet` mode, except replies to the
+  sandbox's own traffic, so other containers can't reach servers it starts.
+- **A slow or broken resume can't stop the sandbox:** a crash-recovery commit
+  that times out, or any other resume error, now starts a fresh sandbox (and is
+  logged as `resume_failed`).
+- **Unexpected errors are reported, not raised:** malformed Docker API
+  responses, odd failures inside a command, and errors in the `rewind_*` tools
+  now come back as error results instead of exceptions in Hermes. Records whose
+  snapshot fields have the wrong types are rejected when read.
+- **Manual checkpoints are capped** by `REWIND_MAX_SNAPSHOTS` like automatic
+  snapshots and restore points (oldest first), so a looping agent can't grow
+  them without end.
+- **Exports in one process run one at a time**, so two can't both pass the
+  total size cap.
+- **CI pins GitHub Actions by commit SHA** instead of by tag.
+
 ## 0.2.4 (2026-11-06)
 
 Hardening after a product and security review, an in-house stress test and an
