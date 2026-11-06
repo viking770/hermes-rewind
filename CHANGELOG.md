@@ -12,10 +12,12 @@ release; `git log c6e8b71..` lists every change.
   sandbox, never the sandbox Hermes shares on purpose for local chats. This is
   the same rule `/rewind` already followed.
 - **Commands that time out are stopped inside the sandbox**, together with
-  their children, background jobs and anything in their session or process
-  group. Before, only the client gave up, and the command kept changing files
-  while a snapshot of that state was taken. The README lists the two ways a
-  process can still escape a timeout.
+  everything they started: children, background jobs, anything in their
+  session or process group, and any process that started after them (which
+  catches ones that detached twice). This works even if the command deleted
+  Rewind's tracking file. Background processes from earlier commands keep
+  running. Before, only the client gave up, and the command kept changing
+  files while a snapshot of that state was taken.
 - **The "internet" network mode no longer reaches this computer.** It now also
   blocks the sandbox's gateway and this computer's own addresses, including a
   server's public IPv4 and IPv6 addresses. It blocks NAT64 and 6to4, and gives
@@ -74,6 +76,20 @@ release; `git log c6e8b71..` lists every change.
 - **Stdin that isn't valid text** (a lone surrogate character) now gives a
   clear error instead of raising an exception into Hermes.
 
+- **Restore points are pruned** to the same cap as automatic snapshots, so
+  repeated undos no longer pile up images. The newest stay, so the latest
+  restores can still be undone.
+- **A command ending in `exit` no longer leaves Rewind's temporary files**
+  behind, where they ended up in the next snapshot.
+- **Command output is capped** at `REWIND_MAX_OUTPUT_KB` (1 MB). The first and
+  last half are kept, with a note; before, 50 MB of output went to Hermes whole.
+- **Exports:** at most `REWIND_EXPORT_MAX_FILES` (20,000) entries. Files are
+  owner-only on Linux and macOS and carry the "downloaded from the internet"
+  mark on Windows. Each skipped item is listed with its real reason; a name
+  Windows can't store was reported as a link or special file before.
+- **A warning when a sandbox grows past `REWIND_MAX_SANDBOX_GB`** (20 GB) of
+  its own data, since every snapshot stores it again.
+
 ### Changed
 - **The default sandbox image includes `git` and `curl`.** It is
   `hermes-rewind-base:1`, built once from the digest-pinned
@@ -94,22 +110,19 @@ release; `git log c6e8b71..` lists every change.
 - `tests/test_qa_logic.py` and `scripts/qa_stress.py`: an independent
   adversarial pass with 41 unit tests and 19 Docker probes.
 
-### Known issues
-Tracked as `expectedFailure` tests in `tests/test_qa_logic.py` and as
-`BUG(...)` results in `scripts/qa_stress.py` where noted. All are Low or
-documented:
-- A process that both leaves the command's session and is orphaned, or a
-  command that deletes Rewind's tracking file in `/tmp`, can survive a timeout
-  (documented in the README; `qa_stress.py`).
-- Restore points are not pruned (`test_qa_logic.py`). Command output has no
-  size cap (`qa_stress.py`).
-- Exports have no file-count cap (`test_qa_logic.py`). Exported files keep
-  group/other read bits, carry no Mark-of-the-Web on Windows, and a file
-  skipped because Windows can't store its name is reported as a link or
-  special file.
-- A command that ends with `exit` leaves small temporary files that end up in
-  snapshots (`qa_stress.py`).
-- A running sandbox has no disk-size limit.
+### Known limits
+All issues from the review, the stress test and the QA pass are fixed. What
+remains are documented design limits:
+- Snapshots cover the sandbox's files only, not running processes or anything
+  sent over the network; the approval prompt for such commands is best effort.
+- The default network mode reaches the internet, so a misled agent can send
+  what is in the sandbox to a website. `REWIND_NETWORK=none` turns that off.
+- Commands run as root inside the container (with most capabilities dropped),
+  so package managers work.
+- There is no hard per-sandbox disk quota (Docker Desktop can't enforce one),
+  only the size warning.
+- The firewall's IPv6 rules have not been exercised against a sandbox with
+  real IPv6 connectivity; without filterable IPv6 the sandbox gets no network.
 
 ## 0.2.3
 

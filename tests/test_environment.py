@@ -361,7 +361,8 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(len(self.runs()), 1)
 
     def test_compaction_off(self):
-        env = make_env(self.fake, compact_mb=0)
+        # With compaction and the size warning both off, snapshots are never inspected.
+        env = make_env(self.fake, compact_mb=0, max_sandbox_gb=0)
         env.execute("rm x")
         self.assertNotIn("image", self.fake.verbs())
 
@@ -391,6 +392,29 @@ class EnvironmentTests(unittest.TestCase):
         env = make_env(self.fake, network=False)
         env.execute("ls")
         self.assertIn("none", self.fake.calls[0])
+
+    def test_warns_once_when_the_sandbox_grows_past_its_size_limit(self):
+        env = make_env(self.fake, max_sandbox_gb=1, compact_mb=0)
+        gb = 1024 ** 3
+        self.fake.image_info = {env.base_image: f"{gb // 10} 4", f"{env.repository}:s1": f"{3 * gb} 5",
+                                f"{env.repository}:s2": f"{3 * gb} 6", f"{env.repository}:s3": f"{gb // 5} 6"}
+        env.execute("rm a")   # s1 holds ~2.9 GB of its own
+        warned = env.execute("rm b")["output"]
+        self.assertIn("REWIND_MAX_SANDBOX_GB", warned)
+        self.assertNotIn("REWIND_MAX_SANDBOX_GB", env.execute("rm c")["output"])  # once, not every command
+        self.assertNotIn("REWIND_MAX_SANDBOX_GB", make_env(self.fake, max_sandbox_gb=0).execute("rm d")["output"])
+
+    def test_long_output_is_capped_but_keeps_both_ends_and_the_cwd(self):
+        env = make_env(self.fake, max_output_kb=1)
+        self.fake.exec_output = "HEAD" + "x" * 5000 + "TAIL"
+        self.fake.exec_cwd = "/workspace/app"
+        result = env.execute("cat big.log")
+        self.assertLess(len(result["output"]), 1024 + 200)
+        self.assertTrue(result["output"].startswith("HEAD"))
+        self.assertTrue(result["output"].rstrip().endswith("TAIL"))
+        self.assertIn("REWIND_MAX_OUTPUT_KB", result["output"])
+        self.assertEqual(result["cwd"], "/workspace/app")  # the marker is read before the cap
+        self.assertEqual(make_env(self.fake, max_output_kb=0).execute("cat big.log")["output"].count("x"), 5000)
 
     def test_printed_marker_cannot_set_the_working_directory(self):
         # Each command gets its own random marker; output carrying another one

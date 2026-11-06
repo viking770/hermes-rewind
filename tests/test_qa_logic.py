@@ -249,7 +249,7 @@ class SnapshotEdgeTests(unittest.TestCase):
             env.execute(f"touch f{i}")
         self.assertEqual(len([s for s in env.snapshots if s.auto]), 3)
 
-    @unittest.expectedFailure  # QA-07: restore points are never pruned, so repeated undos grow without bound
+    # Was QA-07 (fixed): restore points are never pruned, so repeated undos grow without bound
     def test_restore_points_are_bounded(self):
         env = make_env(self.fake, max_snapshots=3)
         env.execute("touch a")
@@ -344,11 +344,36 @@ class ExtractTests(unittest.TestCase):
         with self.assertRaises(RewindError):
             _extract_plain(_tar(entries), self.dest, max_mb=1)
 
-    @unittest.expectedFailure  # QA-09: no cap on the number of files: empty files cost nothing against the MB caps
+    # Was QA-09 (fixed): no cap on the number of files: empty files cost nothing against the MB caps.
+    # The cap is REWIND_EXPORT_MAX_FILES (20,000 by default); past it the export is refused.
     def test_file_count_is_capped(self):
         entries = [(f"d/f{i}", "file", b"") for i in range(5000)]
-        _extract_plain(_tar(entries), self.dest, max_mb=1)
+        with self.assertRaises(RewindError) as ctx:
+            _extract_plain(_tar(entries), self.dest, max_mb=1, max_files=1000)
+        self.assertIn("REWIND_EXPORT_MAX_FILES", str(ctx.exception))
         self.assertLess(sum(1 for _ in self.dest.rglob("*")), 5000)
+
+    def test_skipped_entries_say_why(self):
+        from rewind.environment import SKIP_REASONS, describe_skipped
+        reasons = {}
+        removed = _extract_plain(_tar([("app/ok.txt", "file", b"ok"), ("app/link", "sym", "/etc/passwd")]),
+                                 self.dest, reasons=reasons)
+        self.assertEqual(removed, ["app/link"])
+        self.assertEqual(reasons, {"app/link": "symlink"})
+        message = describe_skipped(removed, reasons)
+        self.assertIn("app/link (" + SKIP_REASONS["symlink"] + ")", message)
+        self.assertEqual(describe_skipped([], {}), "")
+
+    def test_exported_files_are_owner_only_and_marked_downloaded(self):
+        _extract_plain(_tar([("app/run.sh", "file", b"#!/bin/sh\n")]), self.dest)
+        target = self.dest / "app" / "run.sh"
+        if os.name == "nt":
+            zone = Path(f"{target}:Zone.Identifier").read_text(encoding="ascii")
+            self.assertIn("ZoneId=3", zone)
+        else:
+            import stat
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode) & 0o077, 0)  # nothing for group/other
+            self.assertEqual(stat.S_IMODE((self.dest / "app").stat().st_mode) & 0o077, 0)
 
     @unittest.skipUnless(os.name == "nt", "Windows device names")
     def test_windows_device_names_not_written_silently(self):

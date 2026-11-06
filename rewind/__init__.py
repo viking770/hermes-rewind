@@ -19,6 +19,9 @@ Optional settings (environment variables):
     REWIND_EXPORT_DIR     where rewind_export copies files (default <state dir>/exports)
     REWIND_EXPORT_MAX_MB  largest single export allowed (default 500)
     REWIND_EXPORT_TOTAL_MB  cap on everything in the export folder (default 2000)
+    REWIND_EXPORT_MAX_FILES  most files and folders one export may hold (default 20000, 0 = no cap)
+    REWIND_MAX_OUTPUT_KB  command output returned to Hermes, first and last half kept (default 1024, 0 = no cap)
+    REWIND_MAX_SANDBOX_GB  warn when a sandbox's own data passes this (default 20, 0 = never)
     REWIND_CONFIRM_EXPORT set to 0 to stop asking before the agent exports files
     REWIND_CONFIRM_IRREVERSIBLE  set to 0 to stop asking before commands Rewind can't undo
     REWIND_AUTO_GC        set to 0 to stop the automatic cleanup of expired snapshots and leftovers
@@ -141,6 +144,9 @@ class RewindProvider(TerminalEnvironmentProvider):
             store=Store(settings.state_dir()) if keep > 0 else None,
             export_max_mb=settings.export_max_mb(),
             export_total_mb=settings.export_total_mb(),
+            export_max_files=settings.export_max_files(),
+            max_output_kb=settings.max_output_kb(),
+            max_sandbox_gb=settings.max_sandbox_gb(),
         )
         _maybe_gc()
         return env

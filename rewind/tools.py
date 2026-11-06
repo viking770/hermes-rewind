@@ -18,7 +18,7 @@ import subprocess
 import time
 
 from . import audit, policy, registry, settings, store as store_mod, version
-from .environment import RewindError, Snapshot, describe_changes, subprocess_runner
+from .environment import RewindError, Snapshot, describe_changes, describe_skipped, subprocess_runner
 
 TOOLSET = "rewind"
 
@@ -229,8 +229,8 @@ def rewind_export(args, **kwargs):
     removed = env.last_export_removed
     audit.log("export", task_id=env.task_id, via="agent", path=path, host_path=str(copied),
               skipped=len(removed), skipped_paths=removed[:20])
-    note = (f" Removed {len(removed)} symlink(s) or special file(s) that could point elsewhere on "
-            f"this computer: {', '.join(removed[:10])}." if removed else "")
+    skipped = describe_skipped(removed, env.last_export_reasons)
+    note = f" {skipped}" if skipped else ""
     return _ok(host_path=str(copied), removed=removed,
                message=f"Copied {path} to {copied} on the user's computer.{note}")
 
@@ -388,9 +388,8 @@ def slash_rewind(raw_args: str = "", session_key=None, session_id=None, platform
             removed = env.last_export_removed
             audit.log("export", task_id=env.task_id, via="/rewind", path=rest[0], host_path=str(copied),
                       skipped=len(removed), skipped_paths=removed[:20], platform=platform)
-            return f"Copied to {copied}" + (
-                f"\nRemoved {len(removed)} symlink(s) or special file(s): {', '.join(removed[:10])}"
-                if removed else "")
+            skipped = describe_skipped(removed, env.last_export_reasons)
+            return f"Copied to {copied}" + (f"\n{skipped}" if skipped else "")
         return f"Unknown /rewind command {sub!r}.\n\n{SLASH_HELP}"
     except (RewindError, subprocess.TimeoutExpired, OSError) as exc:
         return f"Rewind: {exc}"

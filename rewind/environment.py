@@ -54,6 +54,9 @@ DEFAULT_COMPACT_MB = 256
 DEFAULT_KEEP_HOURS = 24
 DEFAULT_EXPORT_MAX_MB = 500
 DEFAULT_EXPORT_TOTAL_MB = 2000
+DEFAULT_EXPORT_MAX_FILES = 20000
+DEFAULT_MAX_OUTPUT_KB = 1024
+DEFAULT_MAX_SANDBOX_GB = 20
 # Lists files under /workspace as "path<TAB>size<TAB>mtime" for restore summaries.
 _LIST_FILES = (
     f"cd {DEFAULT_CWD} 2>/dev/null && find . -xdev \\( -type f -o -type l \\) "
@@ -314,6 +317,9 @@ class RewindEnvironment:
         store: Optional[Store] = None,
         export_max_mb: int = DEFAULT_EXPORT_MAX_MB,
         export_total_mb: int = DEFAULT_EXPORT_TOTAL_MB,
+        export_max_files: int = DEFAULT_EXPORT_MAX_FILES,
+        max_output_kb: int = DEFAULT_MAX_OUTPUT_KB,
+        max_sandbox_gb: float = DEFAULT_MAX_SANDBOX_GB,
         cpus: Optional[float] = DEFAULT_CPUS,
         memory_mb: Optional[int] = DEFAULT_MEMORY_MB,
         pids_limit: Optional[int] = DEFAULT_PIDS_LIMIT,
@@ -378,6 +384,11 @@ class RewindEnvironment:
         self._store = store
         self.export_max_mb = export_max_mb
         self.export_total_mb = export_total_mb
+        self.export_max_files = max(0, int(export_max_files))
+        self.max_output_chars = max(0, int(max_output_kb)) * 1024
+        self.max_sandbox_bytes = int(max(0.0, float(max_sandbox_gb)) * 1024 ** 3)
+        self._size_warned = False
+        self.last_export_reasons: Dict[str, str] = {}
         self.last_export_removed: List[str] = []
         self._tar_reader = _popen_tar_reader  # tests swap in a fake
         self._host_addresses = host_addresses  # tests swap in a fake
@@ -668,7 +679,7 @@ class RewindEnvironment:
             except subprocess.TimeoutExpired as exc:
                 # Abandoning the client doesn't stop the command: `docker exec`
                 # leaves it running in the container, still changing files.
-                stopped = self._kill_command(pid_file, stdin_file)
+                stopped = self._kill_command(pid_file, stdin_file, marker)
                 code, out = 124, _decode(exc.output) + f"\n[rewind] command timed out after {limit}s" + (
                     " and was stopped." if stopped else
                     "; it could not be stopped and may still be running in the sandbox, so no snapshot "
@@ -686,14 +697,14 @@ class RewindEnvironment:
             # snapshot would hold a half-finished state labelled as a clean one.
             if self._pending is None and stopped:
                 self._start_background()
-            return _result(note + output + after, code, new_cwd)
+            return _result(note + _cap_output(output, self.max_output_chars) + after, code, new_cwd)
 
-    def _kill_command(self, pid_file: str, stdin_file: Optional[str] = None) -> bool:
+    def _kill_command(self, pid_file: str, stdin_file: Optional[str] = None, marker: str = "") -> bool:
         """Stop a timed-out command and everything it started. True when
         nothing of it is left running."""
         try:
             code, out = self._docker("exec", self.container, "sh", "-c",
-                                     _kill_script(pid_file, stdin_file), timeout=60, check=False)
+                                     _kill_script(pid_file, stdin_file, marker), timeout=60, check=False)
         except (RewindError, subprocess.TimeoutExpired, OSError):
             return False
         return code == 0 and _KILL_OK in out
@@ -854,9 +865,12 @@ class RewindEnvironment:
         later snapshots hold only what changed since. It costs a restart, which
         stops background processes, so it only happens past ``compact_bytes``.
         """
-        if not self.compact_bytes:
+        if not self.compact_bytes and not self.max_sandbox_bytes:
             return
         size, layers = self._inspect_image(image)
+        self._check_size(size)
+        if not self.compact_bytes:
+            return
         base_size, _ = self._inspect_image(self._image)
         if not size or size - base_size < self.compact_bytes or layers >= MAX_LAYERS:
             return
@@ -869,6 +883,27 @@ class RewindEnvironment:
             self._ensure_started()
         except (RewindError, subprocess.TimeoutExpired, OSError):
             pass  # execute() retries the start before running the command
+
+    def _check_size(self, size: int) -> None:
+        """Warn (once, until it shrinks again) when the sandbox's own data, the
+        snapshot just taken minus the base image, passes max_sandbox_bytes. A
+        warning, not a hard cap: Docker Desktop's storage driver can't enforce
+        per-container disk quotas, and every snapshot stores that data again."""
+        if not self.max_sandbox_bytes or not size:
+            return
+        base_size, _ = self._inspect_image(self.base_image)
+        own = size - base_size
+        if own <= self.max_sandbox_bytes:
+            self._size_warned = False
+            return
+        if self._size_warned:
+            return
+        self._size_warned = True
+        gb = own / 1024 ** 3
+        audit.log("sandbox_large", task_id=self.task_id, gigabytes=round(gb, 1))
+        self._note += (f"[rewind] warning: this sandbox holds {gb:.1f} GB of its own data, over the "
+                       f"{self.max_sandbox_bytes / 1024 ** 3:g} GB limit (REWIND_MAX_SANDBOX_GB). Each snapshot "
+                       "stores it again; delete what isn't needed, or restore an earlier snapshot.\n")
 
     def _inspect_image(self, image: str) -> Tuple[int, int]:
         """Return (total size in bytes, layer count), or (0, 0) if unknown."""
@@ -886,14 +921,18 @@ class RewindEnvironment:
         return size, layers
 
     def _prune(self) -> None:
-        """Drop the oldest automatic snapshots beyond max_snapshots. Manual ones are kept."""
-        autos = [s for s in self.snapshots if s.auto]
-        excess = len(autos) - self.max_snapshots
-        for snap in autos[:max(0, excess)]:
-            self.snapshots.remove(snap)
-            code, _ = self._docker("rmi", snap.image, timeout=60, check=False)
-            if code != 0:  # e.g. the running container still uses it
-                self._dropped_images.append(snap.image)
+        """Drop the oldest automatic snapshots beyond max_snapshots, and the oldest
+        restore points (the undo points restores save) beyond the same number, so
+        repeated undos can't pile up images. The newest restore points stay, so the
+        latest restores can still be undone. Manual checkpoints are kept."""
+        for kind in ([s for s in self.snapshots if s.auto and not s.restore_point],
+                     [s for s in self.snapshots if s.restore_point]):
+            excess = len(kind) - self.max_snapshots
+            for snap in kind[:max(0, excess)]:
+                self.snapshots.remove(snap)
+                code, _ = self._docker("rmi", snap.image, timeout=60, check=False)
+                if code != 0:  # e.g. the running container still uses it
+                    self._dropped_images.append(snap.image)
 
     def find(self, snapshot_id: str) -> Snapshot:
         if snapshot_id in ("last", "latest", ""):
@@ -1058,7 +1097,10 @@ class RewindEnvironment:
             argv = [self.docker_bin, "cp", f"{self.container}:{src}", "-"]
             try:
                 with self._tar_reader(argv) as stream:
-                    self.last_export_removed = _extract_plain(stream, dest, self.export_max_mb)
+                    self.last_export_reasons = {}
+                    self.last_export_removed = _extract_plain(stream, dest, self.export_max_mb,
+                                                              self.export_max_files,
+                                                              self.last_export_reasons)
             except (tarfile.TarError, OSError) as exc:
                 raise RewindError(f"Couldn't copy {src} out of the sandbox: {exc}") from exc
             name = posixpath.basename(src.rstrip("/")) or "root"
@@ -1139,20 +1181,61 @@ def _popen_tar_reader(argv: Sequence[str]):
             proc.wait()
 
 
-def _extract_plain(stream, dest: Path, max_mb: int = 0) -> List[str]:
+# Why an export skipped an entry, in words for the person who asked for it.
+SKIP_REASONS = {
+    "outside": "its path points outside the export folder",
+    "symlink": "a symlink, which could point elsewhere on this computer",
+    "hardlink": "a hard link to a file that isn't part of this export",
+    "special": "a device, FIFO or other special file",
+    "exists": "a file with that name already exists in the export folder",
+    "name": "a name this computer can't store (for example a reserved Windows name or a newline)",
+}
+
+
+def _owner_only(path: Path, executable: bool = False) -> None:
+    """Exports are readable by this user only (no-op on Windows, where files
+    inherit the folder's ACL)."""
+    if os.name != "nt":
+        os.chmod(path, 0o700 if executable else 0o600)
+
+
+def _mark_downloaded(path: Path) -> None:
+    """On Windows, add the "downloaded from the internet" mark (Mark of the Web),
+    so SmartScreen and Office Protected View treat the file as coming from the
+    agent's sandbox rather than as a local file. Best effort: only NTFS has it."""
+    if os.name != "nt":
+        return
+    try:
+        with open(f"{path}:Zone.Identifier", "w", encoding="ascii", newline="") as ads:
+            ads.write("[ZoneTransfer]\r\nZoneId=3\r\n")
+    except OSError:
+        pass
+
+
+def _extract_plain(stream, dest: Path, max_mb: int = 0, max_files: int = 0,
+                   reasons: Optional[Dict[str, str]] = None) -> List[str]:
     """Unpack a tar stream into ``dest``, writing only regular files and folders.
 
     Skips (and returns, as paths) symlinks, devices, fifos, entries whose path
-    is absolute or climbs out with "..", and names this system can't store. A
-    hard link becomes a plain copy, but only of a regular file this same export
-    already wrote: tar stores the second name of a hard-linked file as a link
-    to the first, and skipping it would silently drop a real file. Files are
-    written without setuid/setgid bits. ``max_mb`` caps the total written,
-    whatever the archive claims.
+    is absolute or climbs out with "..", and names this system can't store;
+    ``reasons`` (if given) gets each skipped path's reason, a key of
+    SKIP_REASONS. A hard link becomes a plain copy, but only of a regular file
+    this same export already wrote: tar stores the second name of a
+    hard-linked file as a link to the first, and skipping it would silently
+    drop a real file. Files are written owner-only and without setuid/setgid
+    bits, and marked as downloaded on Windows. ``max_mb`` caps the total
+    written and ``max_files`` the number of entries, whatever the archive
+    claims (empty files cost nothing against a size cap).
     """
     root = Path(dest).resolve()
-    removed, written, cap = [], 0, max_mb * 1024 * 1024 if max_mb else 0
+    removed, written, count, cap = [], 0, 0, max_mb * 1024 * 1024 if max_mb else 0
     extracted: Dict[str, Path] = {}  # archive path -> regular file written by this export
+    reasons = reasons if reasons is not None else {}
+
+    def skip(path: str, why: str) -> None:
+        removed.append(path)
+        reasons[path] = why
+
     with tarfile.open(fileobj=stream, mode="r|") as archive:
         for member in archive:
             raw = member.name.replace("\\", "/")
@@ -1161,46 +1244,60 @@ def _extract_plain(stream, dest: Path, max_mb: int = 0) -> List[str]:
                 continue
             shown = "/".join(parts)
             if raw.startswith("/") or ".." in parts or ":" in parts[0]:  # absolute, climbing, or C:...
-                removed.append(shown)
+                skip(shown, "outside")
                 continue
             target = root.joinpath(*parts)
             resolved = target.resolve()
             if resolved != root and root not in resolved.parents:
-                removed.append(shown)
+                skip(shown, "outside")
                 continue
+            if member.isdir() or member.isfile() or member.islnk():
+                count += 1
+                if max_files and count > max_files:
+                    raise RewindError(f"The export has more than {max_files:,} files and folders "
+                                      "(REWIND_EXPORT_MAX_FILES).")
             try:
                 if member.isdir():
                     target.mkdir(parents=True, exist_ok=True)
-                elif member.isfile():
-                    if cap and written + member.size > cap:
-                        raise RewindError(f"The export is bigger than the {max_mb} MB limit.")
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    source = archive.extractfile(member)
-                    with open(target, "xb") as out:  # never overwrite
-                        shutil.copyfileobj(source, out)
-                    os.chmod(target, member.mode & 0o755 | 0o600)
-                    written += member.size
-                    extracted[shown] = target
-                elif member.islnk():
-                    link = "/".join(p for p in member.linkname.replace("\\", "/").split("/") if p not in ("", "."))
-                    original = extracted.get(link)
-                    if original is None:  # not a file this export wrote: never follow it
-                        removed.append(shown)
-                        continue
-                    size = original.stat().st_size
+                    _owner_only(target, executable=True)
+                elif member.isfile() or member.islnk():
+                    original = None
+                    if member.islnk():
+                        link = "/".join(p for p in member.linkname.replace("\\", "/").split("/") if p not in ("", "."))
+                        original = extracted.get(link)
+                        if original is None:  # not a file this export wrote: never follow it
+                            skip(shown, "hardlink")
+                            continue
+                    size = original.stat().st_size if original is not None else member.size
                     if cap and written + size > cap:
                         raise RewindError(f"The export is bigger than the {max_mb} MB limit.")
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    with open(original, "rb") as src, open(target, "xb") as out:
-                        shutil.copyfileobj(src, out)
-                    os.chmod(target, member.mode & 0o755 | 0o600)
+                    if target.exists():
+                        skip(shown, "exists")
+                        continue
+                    source = open(original, "rb") if original is not None else archive.extractfile(member)
+                    with source, open(target, "xb") as out:  # never overwrite
+                        shutil.copyfileobj(source, out)
+                    _owner_only(target, executable=bool(member.mode & 0o111))
+                    _mark_downloaded(target)
                     written += size
                     extracted[shown] = target
+                elif member.issym():
+                    skip(shown, "symlink")
                 else:
-                    removed.append(shown)  # symlink, device, fifo
+                    skip(shown, "special")
             except (OSError, ValueError):
-                removed.append(shown)  # e.g. a name Windows can't store ("a:b", "con")
+                skip(shown, "name")  # e.g. a name Windows can't store ("a:b", "con")
     return removed
+
+
+def describe_skipped(removed: List[str], reasons: Dict[str, str], limit: int = 10) -> str:
+    """'Skipped N item(s): a (why), b (why)...' for export messages, or ''."""
+    if not removed:
+        return ""
+    shown = ", ".join(f"{path} ({SKIP_REASONS.get(reasons.get(path, ''), 'skipped')})" for path in removed[:limit])
+    more = f", and {len(removed) - limit} more" if len(removed) > limit else ""
+    return f"Skipped {len(removed)} item(s) that can't be copied safely: {shown}{more}."
 
 
 def _parse_listing(out: str) -> Dict[str, str]:
@@ -1253,6 +1350,18 @@ def _ago(seconds: float) -> str:
     return f"{seconds / 3600:.1f} h"
 
 
+def _cap_output(text: str, limit: int) -> str:
+    """Keep the first and last half of output longer than ``limit`` characters
+    (0 = no cap): a command printing gigabytes would otherwise be handed to
+    Hermes, and the model, whole. The end usually holds the error."""
+    if not limit or len(text) <= limit:
+        return text
+    half = limit // 2
+    note = (f"\n[rewind] output too long: {len(text) - 2 * half:,} characters in the middle "
+            "were left out (REWIND_MAX_OUTPUT_KB).\n")
+    return text[:half] + note + text[-half:]
+
+
 def _result(output: str, code: int, cwd: Optional[str] = None) -> dict:
     result = {"output": output, "returncode": code, "exit_code": code}
     if cwd:
@@ -1272,7 +1381,12 @@ def _wrap(command: str, cwd: str, stdin_file: Optional[str] = None, pid_file: Op
     if stdin_file:
         # A group, not a subshell, so a `cd` inside still carries over.
         command = f"{{\n{command}\n}} < {stdin_file}\n__rewind_rc=$?\nrm -f {stdin_file}\n(exit $__rewind_rc)"
-    start = f"echo $$ > {pid_file}\n" if pid_file else ""
+    # Rewind's own files go however the command ends: a command that runs `exit`
+    # skips the lines after it, and the files would end up in the next snapshot.
+    # An EXIT trap keeps the exit status. (A command that sets its own EXIT trap
+    # replaces this one; the explicit removal below still covers a normal end.)
+    ours = " ".join(f for f in (pid_file, stdin_file, f"{stdin_file}.b64" if stdin_file else None) if f)
+    start = (f"trap 'rm -f {ours}' EXIT\n" if ours else "") + (f"echo $$ > {pid_file}\n" if pid_file else "")
     end = f"rm -f {pid_file}\n" if pid_file else ""
     return (
         start
@@ -1296,32 +1410,59 @@ def _sh_note(text: str) -> str:
 _KILL_OK = "REWIND_KILL_OK"
 
 
-def _kill_script(pid_file: str, stdin_file: Optional[str] = None) -> str:
-    """Shell that stops the command whose shell PID is in ``pid_file``, and
-    every process it started. Plain POSIX sh reading /proc, so it works
-    without procps. ``docker exec`` makes the command's shell a session and
-    process-group leader, so its processes are found by session and group
-    (which catches ones that double-forked and were reparented to PID 1) and
-    by parent PID (which catches ones that called setsid). They are frozen,
-    so they can't fork or move away, found again, then killed. Prints
-    _KILL_OK once none of them is left running."""
+def _kill_script(pid_file: str, stdin_file: Optional[str] = None, marker: str = "") -> str:
+    """Shell that stops a timed-out command and every process it started.
+    Plain POSIX sh reading /proc, so it works without procps.
+
+    The command's shell is found from ``pid_file``, or, if the command deleted
+    that file, by ``marker`` in its own command line (``docker exec`` gives it
+    parent PID 0). What belongs to the command:
+    - its session and process group (``docker exec`` makes the shell a leader
+      of both), which catches children that were reparented to PID 1;
+    - anything whose parent is in the set, which catches ones that called setsid;
+    - anything that started after the shell did, except PID 1 and this
+      script's own session. A sandbox runs one command at a time, so nothing
+      else can start in that window; this catches a process that both left
+      the session and was orphaned. Processes from earlier commands (a dev
+      server, say) started before it and are left alone.
+    They are frozen, so they can't fork or move away, found again, then
+    killed. Prints _KILL_OK once none of them is left running."""
     leftovers = f" {stdin_file} {stdin_file}.b64" if stdin_file else ""
+    done = f'rm -f "$f"{leftovers}; echo {_KILL_OK}; exit 0'
+    # /proc/PID/stat is "pid (comm) state ppid pgrp session ... starttime(22) ...":
+    # comm can hold spaces, so everything up to the last ") " is dropped first,
+    # leaving state as $1, ppid $2, pgrp $3, session $4 and starttime ${20}.
     return "\n".join([
         f"f={pid_file}",
-        f'[ -f "$f" ] || {{ rm -f{leftovers}; echo {_KILL_OK}; exit 0; }}',
-        'read -r root < "$f"',
-        'case "$root" in ""|*[!0-9]*) exit 1;; esac',
-        # /proc/PID/stat is "pid (comm) state ppid pgrp session ...": comm can
-        # hold spaces, so everything up to the last ") " is dropped first.
+        f"m={shlex.quote(marker)}",
+        '{ read -r s < /proc/$$/stat; } 2>/dev/null; set -- ${s##*) }; mine=$4',
+        'root=""',
+        '[ -f "$f" ] && read -r root < "$f"',
+        'if [ -z "$root" ] && [ -n "$m" ]; then',
+        "  for d in /proc/[0-9]*; do",
+        '    { read -r s < "$d/stat"; } 2>/dev/null || continue',
+        '    set -- ${s##*) }',
+        '    [ "$2" = 0 ] && [ "$4" != "$mine" ] || continue',
+        '    grep -aqF -- "$m" "$d/cmdline" 2>/dev/null && { root=${d#/proc/}; break; }',
+        "  done",
+        "fi",
+        f'[ -n "$root" ] || {{ {done}; }}',
+        'case "$root" in *[!0-9]*) exit 1;; esac',
+        '{ read -r s < "/proc/$root/stat"; } 2>/dev/null || { ' + done + '; }',
+        'set -- ${s##*) }; born=${20}',
         "tree() {",
         '  all=" $root "; more=1',
         '  while [ "$more" = 1 ]; do more=0',
         "    for d in /proc/[0-9]*; do",
         "      p=${d#/proc/}",
+        '      [ "$p" = 1 ] && continue',
         '      case "$all" in *" $p "*) continue;; esac',
         '      { read -r s < "$d/stat"; } 2>/dev/null || continue',
         '      set -- ${s##*) }',
-        '      if [ "$4" = "$root" ] || [ "$3" = "$root" ]; then all="$all$p "; more=1; continue; fi',
+        '      [ "$4" = "$mine" ] && continue',
+        '      if [ "$4" = "$root" ] || [ "$3" = "$root" ] || [ "${20}" -ge "$born" ]; then',
+        '        all="$all$p "; more=1; continue',
+        "      fi",
         '      case "$all" in *" $2 "*) all="$all$p "; more=1;; esac',
         "    done",
         "  done",
@@ -1338,7 +1479,7 @@ def _kill_script(pid_file: str, stdin_file: Optional[str] = None) -> str:
         "pids=$(tree); kill -STOP $pids 2>/dev/null",
         "pids=$(tree); kill -KILL $pids 2>/dev/null",
         "for i in 1 2 3 4 5 6 7 8 9 10; do",
-        '  alive "$pids" || { rm -f "$f"' + leftovers + f"; echo {_KILL_OK}; exit 0; }}",
+        f'  alive "$pids" || {{ {done}; }}',
         "  kill -KILL $pids 2>/dev/null; sleep 1",  # whole seconds: not every sleep takes fractions
         "done",
         "exit 1",

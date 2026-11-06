@@ -1,26 +1,26 @@
 # Rewind stress test report
 
-**121/121 checks passed** in 243s. All checks passed.
+**121/121 checks passed** in 244s. All checks passed.
 
-Rewind 0.2.4 (commit `35e6bcc`) · Docker 29.9.1 (linux/amd64) · Windows 11 · Python 3.14.9 · 2026-11-06 16:29 UTC
+Rewind 0.2.4 (commit `6ba09b6`) · Docker 29.9.1 (linux/amd64) · Windows 11 · Python 3.14.9 · 2026-11-06 16:56 UTC
 
 Every check runs real commands in real Docker sandboxes and records what the sandbox actually did. Produced by [`scripts/stress_test.py`](../scripts/stress_test.py).
 
 | Section | What it attacks | Passed | Time |
 |---|---|---|---|
-| ✅ [hardening](#hardening) | Container hardening: capabilities, privileges, limits, nothing from the host. | 14/14 | 17s |
-| ✅ [network](#network) | Network guard: internet yes, this computer / LAN / metadata no. | 17/17 | 41s |
-| ✅ [evasion](#evasion) | Firewall evasion: disguised addresses, DNS tricks, IPv6 mapping, UDP, tampering. | 16/16 | 17s |
-| ✅ [undo](#undo) | Snapshots, undo, restore, undo of undo, preview, history limits. | 13/13 | 60s |
+| ✅ [hardening](#hardening) | Container hardening: capabilities, privileges, limits, nothing from the host. | 14/14 | 23s |
+| ✅ [network](#network) | Network guard: internet yes, this computer / LAN / metadata no. | 17/17 | 49s |
+| ✅ [evasion](#evasion) | Firewall evasion: disguised addresses, DNS tricks, IPv6 mapping, UDP, tampering. | 16/16 | 15s |
+| ✅ [undo](#undo) | Snapshots, undo, restore, undo of undo, preview, history limits. | 13/13 | 58s |
 | ✅ [stdin](#stdin) | Hermes's file tools send contents on stdin: must arrive byte-exact. | 1/1 | 6s |
 | ✅ [timeout](#timeout) | A command that times out is stopped, with everything it started. | 4/4 | 14s |
-| ✅ [compaction](#compaction) | Big changes don't make every later snapshot store them again. | 2/2 | 20s |
+| ✅ [compaction](#compaction) | Big changes don't make every later snapshot store them again. | 2/2 | 19s |
 | ✅ [export](#export) | Exports bring only plain files onto this computer. | 9/9 | 7s |
 | ✅ [isolation](#isolation) | Each chat reaches only its own sandbox. | 10/10 | 11s |
 | ✅ [approval](#approval) | Commands Rewind can't undo need the user's approval first. | 23/23 | 0s |
 | ✅ [parking](#parking) | Undo history survives Hermes shutting an idle sandbox down. | 6/6 | 23s |
-| ✅ [audit](#audit) | The audit log records what happened, with secrets masked. | 5/5 | 16s |
-| ✅ [cleanup](#cleanup) | Every container and image the run created is removed. | 1/1 | 10s |
+| ✅ [audit](#audit) | The audit log records what happened, with secrets masked. | 5/5 | 10s |
+| ✅ [cleanup](#cleanup) | Every container and image the run created is removed. | 1/1 | 9s |
 
 ## hardening
 
@@ -47,7 +47,7 @@ Every check runs real commands in real Docker sandboxes and records what the san
 |---|---|---|
 | ✅ | guard installed (no fallback warning) | first command printed: up |
 | ✅ | internet reachable (HTTPS) | GET https://example.com -> 200 |
-| ✅ | DNS works | example.com resolves to 172.66.147.243 |
+| ✅ | DNS works | example.com resolves to 104.20.23.154 |
 | ✅ | sandbox gateway 172.17.0.1 blocked | connect 172.17.0.1:80 -> connection refused |
 | ✅ | cloud metadata 169.254.169.254 blocked | connect 169.254.169.254:80 -> connection refused |
 | ✅ | Azure platform address 168.63.129.16 (WireServer) blocked | connect 168.63.129.16:80 -> connection refused |
@@ -88,8 +88,8 @@ Every check runs real commands in real Docker sandboxes and records what the san
 
 | | Check | What happened |
 |---|---|---|
-| ✅ | rm -rf of the working directory took effect (not recreated) | after rm -rf /workspace/app (the working directory): gone |
-| ✅ | says the working directory is gone and runs in /workspace | [rewind] note: /workspace/app no longer exists, so this ran in /workspace. / pwd=/workspace |
+| ✅ | rm -rf of the working directory took effect (not recreated) | after rm -rf /workspace/app (the working directory): [rewind] note: /workspace/app no longer exists, so this ran in /workspace. |
+| ✅ | says the working directory is gone and runs in /workspace | gone / pwd=/workspace |
 | ✅ | undo brings the folder back | restored s2 (state before running: rm -rf /workspace/app); f2.txt=v2 |
 | ✅ | undo of the undo removes it again | restored s3; /workspace/app: gone |
 | ✅ | undo again is repeat-safe (same state) | /workspace/app has 3 files |
@@ -112,7 +112,7 @@ Every check runs real commands in real Docker sandboxes and records what the san
 
 | | Check | What happened |
 |---|---|---|
-| ✅ | returns soon after the limit | 4 s limit: returned after 7.7s with exit 124 |
+| ✅ | returns soon after the limit | 4 s limit: returned after 7.6s with exit 124 |
 | ✅ | reports that it was stopped | [rewind] command timed out after 4s and was stopped. |
 | ✅ | detached, setsid and nohup children are all killed | `(sleep 301 &); setsid sleep 302 & nohup sleep 303 >/dev/null 2>&1 & sleep 304`: 0 of its sleep processes left running |
 | ✅ | sandbox still works and can undo after a timeout | after undo, /workspace/w: missing |
@@ -134,7 +134,7 @@ Every check runs real commands in real Docker sandboxes and records what the san
 | ✅ | FIFOs are not created | pipe is in the skipped list |
 | ✅ | setuid bit dropped | sandbox mode 4755 -> exported mode 666 |
 | ✅ | nothing lands outside the export folder | every exported path is under the export folder |
-| ✅ | a second export never overwrites the first | first: …/20261106-215830, second: …/20261106-215830_2 |
+| ✅ | a second export never overwrites the first | first: …/20261106-222552, second: …/20261106-222552_2 |
 | ✅ | export over the size cap is refused | /workspace/huge is 3 MB, over the 2 MB export limit (REWIND_EXPORT_MAX_MB). |
 | ✅ | export of a missing path is refused | /workspace/does-not-exist does not exist in the sandbox. |
 

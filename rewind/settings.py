@@ -6,7 +6,8 @@ from pathlib import Path
 
 from . import store as store_mod
 from .environment import (
-    DEFAULT_CPUS, DEFAULT_EXPORT_MAX_MB, DEFAULT_EXPORT_TOTAL_MB, DEFAULT_KEEP_HOURS, DEFAULT_MEMORY_MB, DEFAULT_PIDS_LIMIT,
+    DEFAULT_CPUS, DEFAULT_EXPORT_MAX_FILES, DEFAULT_EXPORT_MAX_MB, DEFAULT_EXPORT_TOTAL_MB, DEFAULT_MAX_OUTPUT_KB,
+    DEFAULT_MAX_SANDBOX_GB, DEFAULT_KEEP_HOURS, DEFAULT_MEMORY_MB, DEFAULT_PIDS_LIMIT,
     NETWORK_MODES,
 )
 
@@ -74,6 +75,21 @@ def export_dir() -> Path:
 
 def export_max_mb() -> int:
     return int(max(0, _float("REWIND_EXPORT_MAX_MB", DEFAULT_EXPORT_MAX_MB)))
+
+
+def export_max_files() -> int:
+    """Most files and folders one export may hold (REWIND_EXPORT_MAX_FILES, 0 = no cap)."""
+    return int(max(0, _float("REWIND_EXPORT_MAX_FILES", DEFAULT_EXPORT_MAX_FILES)))
+
+
+def max_output_kb() -> int:
+    """Command output returned to Hermes, in KB (REWIND_MAX_OUTPUT_KB, 0 = no cap)."""
+    return int(max(0, _float("REWIND_MAX_OUTPUT_KB", DEFAULT_MAX_OUTPUT_KB)))
+
+
+def max_sandbox_gb() -> float:
+    """Warn when a sandbox's own data passes this size (REWIND_MAX_SANDBOX_GB, 0 = never)."""
+    return max(0.0, _float("REWIND_MAX_SANDBOX_GB", DEFAULT_MAX_SANDBOX_GB))
 
 
 def export_total_mb() -> int:

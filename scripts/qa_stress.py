@@ -108,7 +108,10 @@ def fake_marker_sets_cwd():
 def exit_leaves_temp_files():
     env = make("exit", background=False)
     sh(env, "exit 3", stdin_data="x")
-    left = sh(env, "ls -a /tmp | grep -c rewind || true")["output"].strip()
+    # The checking command has a tracking file of its own while it runs (it holds
+    # this shell's PID, $$); only files left by the earlier command count.
+    left = sh(env, 'n=0; for f in /tmp/.rewind-*; do [ -e "$f" ] || continue; '
+                   '[ "$(cat "$f" 2>/dev/null)" = "$$" ] && continue; n=$((n+1)); done; echo $n')["output"].strip()
     status = "BUG(QA-11)" if left not in ("", "0") else "PASS"
     report("exit_leaves_temp_files", status, f"{left} /tmp/.rewind-* file(s) left behind (they get committed into snapshots)")
 
