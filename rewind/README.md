@@ -156,6 +156,7 @@ To give yourself longer before Hermes shuts an idle sandbox down, raise Hermes's
 ```bash
 python3 -m unittest discover -s tests -t .                                  # unit tests, no Docker needed
 REWIND_INTEGRATION=1 python3 -m unittest tests.test_docker_integration -v  # real Docker
+python3 scripts/stress_test.py   # ~100 attacks on every protection, real Docker (--list for sections)
 hermes plugins validate ./rewind --install-deps
 python3 scripts/dev_install.py   # copy into Hermes and restart the gateway
 python3 scripts/e2e_hermes.py    # scripted chat with a real model; checks the tool results

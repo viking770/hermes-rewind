@@ -293,9 +293,16 @@ class ExportSafetyTests(unittest.TestCase):
         self.assertEqual((dest / "app" / "ok.txt").read_text(), "fine")
         self.assertEqual((dest / "app" / ".env").read_text(), "dotfile kept")  # leading dot survives
         self.assertTrue((dest / "app" / "sub").is_dir())
-        for name in ("app/trap", "app/hard", "app/fifo", "app/dev", "../escape.txt", "abs/evil.txt"):
+        for name in ("app/trap", "app/fifo", "app/dev", "../escape.txt", "abs/evil.txt",
+                     "app/hard-passwd", "app/hard-escape", "app/hard-ahead"):
             self.assertIn(name, removed)
         self.assertFalse((dest / "app" / "trap").exists())
+        # A hard link to a file this export wrote becomes a plain copy (tar stores the
+        # second name of a hard-linked file that way); any other hard link is skipped.
+        self.assertEqual((dest / "app" / "hard").read_text(), "fine")
+        self.assertNotIn("app/hard", removed)
+        for name in ("hard-passwd", "hard-escape", "hard-ahead"):
+            self.assertFalse((dest / "app" / name).exists())
         self.assertFalse((dest.parent / "escape.txt").exists())
         self.assertFalse(outside.exists())
         mode = stat.S_IMODE(os.stat(dest / "app" / "setuid").st_mode)
@@ -339,6 +346,10 @@ def hostile_tar(big: int = 0) -> io.BytesIO:
         add("app/setuid", data=b"x", mode=0o4755)
         add("app/trap", tarfile.SYMTYPE, linkname="/etc/passwd")
         add("app/hard", tarfile.LNKTYPE, linkname="app/ok.txt")
+        add("app/hard-passwd", tarfile.LNKTYPE, linkname="/etc/passwd")
+        add("app/hard-escape", tarfile.LNKTYPE, linkname="../escape.txt")
+        add("app/hard-ahead", tarfile.LNKTYPE, linkname="app/later.txt")  # not written (yet)
+        add("app/later.txt", data=b"later")
         add("app/fifo", tarfile.FIFOTYPE)
         add("app/dev", tarfile.CHRTYPE)
         add("../escape.txt", data=b"escaped")

@@ -401,8 +401,11 @@ class RewindEnvironment:
             self._limits = []
             audit.log("limits_unavailable", task_id=self.task_id, error=str(exc)[:200])
             self._note += ("[rewind] warning: this Docker can't apply CPU/memory/process limits, "
-                           "so the sandbox runs without them.\n")
-            self._run_container(image, "none" if mode == "none" else "bridge")
+                           f"so the sandbox runs without them ({str(exc)[:200]}).\n")
+            try:
+                self._run_container(image, "none" if mode == "none" else "bridge")
+            except RewindError as retry_exc:
+                raise RewindError(f"{retry_exc} (after: {str(exc)[:300]})") from exc
         self._image = image
         if mode == "internet":
             try:
@@ -432,7 +435,10 @@ class RewindEnvironment:
         ]
         if network == "none":
             argv += ["--network", "none"]
-        keepalive = f"mkdir -p {shlex.quote(self.cwd)}; while :; do sleep 3600; done"
+        # The starting directory is created only in a brand-new sandbox. A restored or
+        # resumed one keeps its files as they were: a folder the agent deleted stays deleted.
+        dirs = [DEFAULT_CWD] + ([self.cwd] if image == self.base_image and self.cwd != DEFAULT_CWD else [])
+        keepalive = f"mkdir -p {' '.join(shlex.quote(d) for d in dirs)}; while :; do sleep 3600; done"
         argv += ["--entrypoint", "/bin/sh", image, "-c", keepalive]
         # The first run may pull the image, which can take a while.
         try:
@@ -441,7 +447,23 @@ class RewindEnvironment:
             # A failed or timed-out run can leave a container behind under our
             # name, which would make every retry fail with a name conflict.
             self._docker("rm", "-f", self.container, timeout=60, check=False)
+            self._wait_until_gone()
             raise
+
+    def _wait_until_gone(self, seconds: float = 15.0) -> None:
+        """Wait until no container has our name. A forced removal can still be
+        finishing when `docker rm -f` returns, and a retry would then collide."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            try:
+                code, _ = self._docker("container", "inspect", "--format", "{{.Id}}", self.container,
+                                       timeout=30, check=False)
+            except (subprocess.TimeoutExpired, OSError):
+                return
+            if code != 0:
+                return
+            self._docker("rm", "-f", self.container, timeout=60, check=False)
+            time.sleep(0.5)
 
     # --------------------------------------------------------- network guard
     def _guard_network(self) -> None:
@@ -1084,13 +1106,17 @@ def _popen_tar_reader(argv: Sequence[str]):
 def _extract_plain(stream, dest: Path, max_mb: int = 0) -> List[str]:
     """Unpack a tar stream into ``dest``, writing only regular files and folders.
 
-    Skips (and returns, as paths) links, devices, fifos, entries whose path is
-    absolute or climbs out with "..", and names this system can't store.
-    Files are written without setuid/setgid bits. ``max_mb`` caps the total
-    written, whatever the archive claims.
+    Skips (and returns, as paths) symlinks, devices, fifos, entries whose path
+    is absolute or climbs out with "..", and names this system can't store. A
+    hard link becomes a plain copy, but only of a regular file this same export
+    already wrote: tar stores the second name of a hard-linked file as a link
+    to the first, and skipping it would silently drop a real file. Files are
+    written without setuid/setgid bits. ``max_mb`` caps the total written,
+    whatever the archive claims.
     """
     root = Path(dest).resolve()
     removed, written, cap = [], 0, max_mb * 1024 * 1024 if max_mb else 0
+    extracted: Dict[str, Path] = {}  # archive path -> regular file written by this export
     with tarfile.open(fileobj=stream, mode="r|") as archive:
         for member in archive:
             raw = member.name.replace("\\", "/")
@@ -1118,8 +1144,24 @@ def _extract_plain(stream, dest: Path, max_mb: int = 0) -> List[str]:
                         shutil.copyfileobj(source, out)
                     os.chmod(target, member.mode & 0o755 | 0o600)
                     written += member.size
+                    extracted[shown] = target
+                elif member.islnk():
+                    link = "/".join(p for p in member.linkname.replace("\\", "/").split("/") if p not in ("", "."))
+                    original = extracted.get(link)
+                    if original is None:  # not a file this export wrote: never follow it
+                        removed.append(shown)
+                        continue
+                    size = original.stat().st_size
+                    if cap and written + size > cap:
+                        raise RewindError(f"The export is bigger than the {max_mb} MB limit.")
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with open(original, "rb") as src, open(target, "xb") as out:
+                        shutil.copyfileobj(src, out)
+                    os.chmod(target, member.mode & 0o755 | 0o600)
+                    written += size
+                    extracted[shown] = target
                 else:
-                    removed.append(shown)  # symlink, hard link, device, fifo
+                    removed.append(shown)  # symlink, device, fifo
             except (OSError, ValueError):
                 removed.append(shown)  # e.g. a name Windows can't store ("a:b", "con")
     return removed
@@ -1197,13 +1239,21 @@ def _wrap(command: str, cwd: str, stdin_file: Optional[str] = None, pid_file: Op
     end = f"rm -f {pid_file}\n" if pid_file else ""
     return (
         start
-        + f"cd {q} 2>/dev/null || {{ mkdir -p {q} && cd {q}; }}\n"
+        # A directory that no longer exists (the last command deleted it) is not
+        # recreated: the command runs in /workspace instead, and says so.
+        + f"cd {q} 2>/dev/null || {{ mkdir -p {DEFAULT_CWD} && cd {DEFAULT_CWD} && "
+        f"echo \"[rewind] note: {_sh_note(cwd)} no longer exists, so this ran in {DEFAULT_CWD}.\" >&2; }}\n"
         f"{command}\n"
         "__rewind_rc=$?\n"
         + end
         + f"printf '\\n{_CWD_MARKER}%s\\n' \"$(pwd)\"\n"
         "exit $__rewind_rc\n"
     )
+
+
+def _sh_note(text: str) -> str:
+    """``text`` made safe inside a double-quoted shell string."""
+    return re.sub(r'[\\"$`]', "", text)[:200]
 
 
 _KILL_OK = "REWIND_KILL_OK"

@@ -55,6 +55,8 @@ class FakeDocker:
             if self.timeout_exec:
                 raise subprocess.TimeoutExpired(argv, timeout, output=b"partial")
             return self.exec_code, f"{self.exec_output}\n{_CWD_MARKER}{self.exec_cwd}\n"
+        if verb == "container" and argv[2] == "inspect":
+            return 1, "Error: No such container"  # `rm -f` always removes it in the fake
         if verb == "diff":
             return 0, self.diff_output
         if verb == "image" and argv[2] == "inspect":
@@ -200,8 +202,10 @@ class EnvironmentTests(unittest.TestCase):
         result = env.execute("ls")
         self.assertEqual(result["exit_code"], 1)
         self.assertIn("could not start", result["output"])
-        # The half-created container is removed so a retry can reuse the name.
-        self.assertEqual(self.fake.calls[-1], ["docker", "rm", "-f", env.container])
+        # The half-created container is removed, and confirmed gone, so a retry can reuse the name.
+        self.assertEqual(self.fake.calls[-2], ["docker", "rm", "-f", env.container])
+        self.assertEqual(self.fake.calls[-1][1:3], ["container", "inspect"])
+        self.assertEqual(self.fake.calls[-1][-1], env.container)
         self.fake.fail.clear()
         self.assertEqual(env.execute("ls")["exit_code"], 0)
 

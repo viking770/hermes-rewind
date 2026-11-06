@@ -41,7 +41,7 @@ jobs:
   docker:
     name: Docker integration
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -51,6 +51,8 @@ jobs:
         env:
           REWIND_INTEGRATION: "1"
         run: python -m unittest tests.test_docker_integration -v
+      - name: Stress test (attacks every protection)
+        run: python scripts/stress_test.py
       - name: No sandboxes left behind
         if: always()
         run: |
