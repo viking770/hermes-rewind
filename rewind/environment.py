@@ -210,7 +210,11 @@ def _default_gateways(route_table: str) -> List[str]:
 # so stop compacting well before that and let snapshots grow instead.
 MAX_LAYERS = 100
 _CWD_MARKER = "__REWIND_CWD__"
-_STDIN_CHUNK = 96 * 1024  # base64 characters per command, under Linux's 128 KB argument limit
+# Base64 characters per command. Linux allows 128 KB per argument, but on Windows
+# the whole `docker` command line is capped at 32,767 characters (CreateProcess),
+# which the CLI path hits; the API path has no such limit but the smaller size
+# costs it only a few more fast calls.
+_STDIN_CHUNK = 24 * 1024 if os.name == "nt" else 96 * 1024
 _SLUG = re.compile(r"[^a-z0-9]+")
 
 # A runner takes (argv, timeout_seconds) and returns (exit_code, combined_output).
@@ -634,8 +638,9 @@ class RewindEnvironment:
                 except (RewindError, subprocess.TimeoutExpired, OSError) as exc:
                     return _result(f"[rewind] could not pass stdin to the command: {exc}", 1)
             pid_file = f"/tmp/.rewind-pid-{uuid.uuid4().hex[:12]}"
+            marker = _cwd_marker()
             argv = [self.docker_bin, "exec", self.container, self._shell, "-c",
-                    _wrap(command, cwd, stdin_file, pid_file)]
+                    _wrap(command, cwd, stdin_file, pid_file, marker)]
             stopped = True
             try:
                 code, out = self._run(argv, limit)
@@ -650,7 +655,7 @@ class RewindEnvironment:
                 )
                 audit.log("command_timeout", task_id=self.task_id, seconds=limit, stopped=stopped)
 
-            output, new_cwd = _split_cwd(out)
+            output, new_cwd = _split_cwd(out, marker)
             if new_cwd:
                 self.cwd = new_cwd
             # The state after this command is the state before the next one,
@@ -707,10 +712,8 @@ class RewindEnvironment:
     def _park(self) -> None:
         previous = self._image
         if self._started:
-            if self._pending is not None:  # already holds the current state
-                state, self._pending = self._pending.image, None
-            else:
-                state = self._commit().image
+            self._drop_pending()  # the parked state is the state now (see restore)
+            state = self._commit().image
             self._docker("rm", "-f", self.container, timeout=60)
             self._started = False
             self._image = state
@@ -755,6 +758,7 @@ class RewindEnvironment:
         with self._lock:
             self._finish_background()
             self._ensure_started()
+            self._drop_pending()  # a checkpoint holds the state now, not the last background commit
             snap = self._take_snapshot(label=label or "manual", command="", auto=False)
             # The state is unchanged, so the next command can have a snapshot ready too.
             self._start_background()
@@ -782,6 +786,13 @@ class RewindEnvironment:
         self._prune()
         self._persist()
         return snap
+
+    def _drop_pending(self) -> None:
+        """Discard an unclaimed background snapshot, for callers that need the
+        state as it is now: it may predate a write the read-only check missed."""
+        if self._pending is not None:
+            image, self._pending = self._pending.image, None
+            self._docker("rmi", "-f", image, timeout=120, check=False)
 
     def _commit(self) -> _Pending:
         self._seq += 1
@@ -891,6 +902,10 @@ class RewindEnvironment:
             self._ensure_started()
             target = self.find(snapshot_id)
             before = self._list_files_in_container()
+            # The undo point must hold the state as it is *now*. A background snapshot
+            # may predate a write the read-only check missed, and reusing it would make
+            # "undo the undo" lose that write, so this one is always a fresh commit.
+            self._drop_pending()
             # No compaction: the container is replaced right after anyway.
             safety = self._take_snapshot(
                 label=f"before restoring {target.id}", command="", auto=False, compact=False,
@@ -1226,7 +1241,8 @@ def _result(output: str, code: int, cwd: Optional[str] = None) -> dict:
     return result
 
 
-def _wrap(command: str, cwd: str, stdin_file: Optional[str] = None, pid_file: Optional[str] = None) -> str:
+def _wrap(command: str, cwd: str, stdin_file: Optional[str] = None, pid_file: Optional[str] = None,
+          marker: str = _CWD_MARKER) -> str:
     """Run ``command`` in ``cwd`` and report the final directory so cd persists.
     With ``stdin_file``, the command reads it as stdin and it is removed after.
     With ``pid_file``, the shell's PID is written there while the command runs,
@@ -1246,7 +1262,7 @@ def _wrap(command: str, cwd: str, stdin_file: Optional[str] = None, pid_file: Op
         f"{command}\n"
         "__rewind_rc=$?\n"
         + end
-        + f"printf '\\n{_CWD_MARKER}%s\\n' \"$(pwd)\"\n"
+        + f"printf '\\n{marker}%s\\n' \"$(pwd)\"\n"
         "exit $__rewind_rc\n"
     )
 
@@ -1308,15 +1324,31 @@ def _kill_script(pid_file: str, stdin_file: Optional[str] = None) -> str:
     ])
 
 
-def _split_cwd(out: str) -> Tuple[str, Optional[str]]:
-    idx = out.rfind(_CWD_MARKER)
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _cwd_marker() -> str:
+    """A marker for one command's final directory. Random, so output that happens
+    to contain (or deliberately prints) a marker can't set the working directory."""
+    return f"__REWIND_CWD_{uuid.uuid4().hex[:16]}__"
+
+
+def _split_cwd(out: str, marker: str = _CWD_MARKER) -> Tuple[str, Optional[str]]:
+    """Take the final directory the wrapper printed out of ``out``. Only an
+    absolute path with no control characters counts; anything else (an
+    unterminated heredoc that swallowed the wrapper's last lines, say) leaves
+    the output alone and the working directory unchanged."""
+    idx = out.rfind(marker)
     if idx == -1:
         return out, None
-    cwd, _, trailing = out[idx + len(_CWD_MARKER):].partition("\n")
+    cwd, _, trailing = out[idx + len(marker):].partition("\n")
+    cwd = cwd.strip()
+    if not cwd.startswith("/") or _CONTROL.search(cwd) or len(cwd) > 4096:
+        return out, None
     body = out[:idx]
     if body.endswith("\n"):  # the newline _wrap printed before the marker
         body = body[:-1]
-    return body + trailing, cwd.strip() or None
+    return body + trailing, cwd
 
 
 def _decode(data) -> str:

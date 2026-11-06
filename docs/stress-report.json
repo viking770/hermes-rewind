@@ -1,26 +1,26 @@
 {
-  "date": "2026-11-06 11:08 UTC",
+  "date": "2026-11-06 14:05 UTC",
   "rewind": "0.2.4",
-  "commit": "d0cf4eb",
+  "commit": "df1f6e5",
   "docker": "29.9.1 (linux/amd64)",
   "host": "Windows 11",
   "python": "3.14.9",
-  "seconds": 257.5,
+  "seconds": 162.5,
   "passed": 99,
   "total": 99,
   "section_seconds": {
-    "hardening": 17.4,
-    "network": 40.6,
-    "undo": 114.9,
-    "stdin": 4.8,
-    "timeout": 12.9,
-    "compaction": 16.9,
-    "export": 7.1,
-    "isolation": 9.5,
-    "approval": 0.0,
-    "parking": 17.5,
-    "audit": 8.9,
-    "cleanup": 7.0
+    "hardening": 15.7,
+    "network": 30.3,
+    "undo": 45.6,
+    "stdin": 5.0,
+    "timeout": 10.7,
+    "compaction": 14.0,
+    "export": 5.0,
+    "isolation": 7.5,
+    "approval": 0.1,
+    "parking": 15.6,
+    "audit": 8.0,
+    "cleanup": 5.2
   },
   "results": [
     {
@@ -207,13 +207,13 @@
       "section": "undo",
       "check": "rm -rf of the working directory took effect (not recreated)",
       "ok": true,
-      "evidence": "after rm -rf /workspace/app (the working directory): gone"
+      "evidence": "after rm -rf /workspace/app (the working directory): [rewind] note: /workspace/app no longer exists, so this ran in /workspace."
     },
     {
       "section": "undo",
       "check": "says the working directory is gone and runs in /workspace",
       "ok": true,
-      "evidence": "[rewind] note: /workspace/app no longer exists, so this ran in /workspace. / pwd=/workspace"
+      "evidence": "gone / pwd=/workspace"
     },
     {
       "section": "undo",
@@ -291,7 +291,7 @@
       "section": "timeout",
       "check": "returns soon after the limit",
       "ok": true,
-      "evidence": "4 s limit: returned after 7.6s with exit 124"
+      "evidence": "4 s limit: returned after 6.1s with exit 124"
     },
     {
       "section": "timeout",
@@ -363,7 +363,7 @@
       "section": "export",
       "check": "a second export never overwrites the first",
       "ok": true,
-      "evidence": "first: …/20261106-163741, second: …/20261106-163742"
+      "evidence": "first: …/20261106-193438, second: …/20261106-193439"
     },
     {
       "section": "export",

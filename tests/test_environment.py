@@ -54,7 +54,10 @@ class FakeDocker:
                 return (1, "") if self.kill_fails else (0, "REWIND_KILL_OK\n")
             if self.timeout_exec:
                 raise subprocess.TimeoutExpired(argv, timeout, output=b"partial")
-            return self.exec_code, f"{self.exec_output}\n{_CWD_MARKER}{self.exec_cwd}\n"
+            # Answer with the marker this command's wrapper asked for (random per command).
+            found = re.search(r"__REWIND_CWD_[0-9a-f]+__", argv[-1])
+            marker = found.group(0) if found else _CWD_MARKER
+            return self.exec_code, f"{self.exec_output}\n{marker}{self.exec_cwd}\n"
         if verb == "container" and argv[2] == "inspect":
             return 1, "Error: No such container"  # `rm -f` always removes it in the fake
         if verb == "diff":
@@ -389,6 +392,19 @@ class EnvironmentTests(unittest.TestCase):
         env.execute("ls")
         self.assertIn("none", self.fake.calls[0])
 
+    def test_printed_marker_cannot_set_the_working_directory(self):
+        # Each command gets its own random marker; output carrying another one
+        # (or the old fixed one) is just output.
+        from rewind.environment import _cwd_marker, _split_cwd
+        mine, other = _cwd_marker(), _cwd_marker()
+        self.assertNotEqual(mine, other)
+        out = f"{_CWD_MARKER}/etc\n{other}/root\nhello\n\n{mine}/workspace/app\n"
+        text, cwd = _split_cwd(out, mine)
+        self.assertEqual(cwd, "/workspace/app")
+        self.assertIn(f"{_CWD_MARKER}/etc", text)
+        for bad in ("relative/dir", "/ok\x1b[31m", "%s\\n' \"/x\""):
+            self.assertEqual(_split_cwd(f"x\n{mine}{bad}\n", mine)[1], None, bad)
+
     def test_split_cwd_keeps_late_output(self):
         from rewind.environment import _split_cwd
         out, cwd = _split_cwd(f"a\n\n{_CWD_MARKER}/x\nlate stderr\n")
@@ -473,27 +489,30 @@ class BackgroundSnapshotTests(unittest.TestCase):
         env.execute("rm y")
         self.assertEqual(order[-2:], ["commit done", "rm y runs"])
 
-    def test_restore_uses_ready_snapshot_as_safety_and_prepares_another(self):
+    def test_restore_commits_a_fresh_safety_snapshot_and_prepares_another(self):
+        # The ready background snapshot may predate a write the read-only check
+        # missed (QA-01), so the restore's undo point is always a fresh commit.
         env = self.env
         env.execute("rm a")   # s1 (committed first), s2 pending
         env._finish_background()
         _, verbs = self.calls_during(lambda: env.restore("s1"))
         target, safety = env.find("s1"), env.snapshots[-1]
-        self.assertEqual(safety.id, "s2")
+        self.assertEqual(safety.id, "s3")
         self.assertEqual(safety.label, "before restoring s1")
-        self.assertNotIn("commit", verbs[:verbs.index("run")])  # safety was already committed
+        self.assertIn(f"{env.repository}:s2", [c for c in self.fake.calls if c[1] == "rmi"][0])  # stale one dropped
+        self.assertIn("commit", verbs[:verbs.index("run")])  # safety committed now
         self.assertEqual(verbs[-1], "commit")  # prepared for the next change
-        self.assertEqual(env._pending.id, "s3")
+        self.assertEqual(env._pending.id, "s4")
         self.assertIn(target.image, [c for c in self.fake.calls if c[1] == "run"][-1])
 
-    def test_manual_snapshot_claims_pending_and_prepares_another(self):
+    def test_manual_snapshot_is_a_fresh_commit_and_prepares_another(self):
         env = self.env
         env.execute("ls")
-        env._finish_background()
+        env._finish_background()   # s1 pending
         snap = env.snapshot("checkpoint")
-        self.assertEqual((snap.id, snap.label, snap.auto), ("s1", "checkpoint", False))
+        self.assertEqual((snap.id, snap.label, snap.auto), ("s2", "checkpoint", False))
         env._finish_background()
-        self.assertEqual(env._pending.id, "s2")
+        self.assertEqual(env._pending.id, "s3")
 
     def test_cleanup_removes_unclaimed_pending_image(self):
         env = self.env

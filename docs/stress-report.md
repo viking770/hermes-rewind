@@ -1,25 +1,25 @@
 # Rewind stress test report
 
-**99/99 checks passed** in 257s. All checks passed.
+**99/99 checks passed** in 162s. All checks passed.
 
-Rewind 0.2.4 (commit `d0cf4eb`) · Docker 29.9.1 (linux/amd64) · Windows 11 · Python 3.14.9 · 2026-11-06 11:08 UTC
+Rewind 0.2.4 (commit `df1f6e5`) · Docker 29.9.1 (linux/amd64) · Windows 11 · Python 3.14.9 · 2026-11-06 14:05 UTC
 
 Every check runs real commands in real Docker sandboxes and records what the sandbox actually did. Produced by [`scripts/stress_test.py`](../scripts/stress_test.py).
 
 | Section | What it attacks | Passed | Time |
 |---|---|---|---|
-| ✅ [hardening](#hardening) | Container hardening: capabilities, privileges, limits, nothing from the host. | 14/14 | 17s |
-| ✅ [network](#network) | Network guard: internet yes, this computer / LAN / metadata no. | 16/16 | 41s |
-| ✅ [undo](#undo) | Snapshots, undo, restore, undo of undo, preview, history limits. | 13/13 | 115s |
+| ✅ [hardening](#hardening) | Container hardening: capabilities, privileges, limits, nothing from the host. | 14/14 | 16s |
+| ✅ [network](#network) | Network guard: internet yes, this computer / LAN / metadata no. | 16/16 | 30s |
+| ✅ [undo](#undo) | Snapshots, undo, restore, undo of undo, preview, history limits. | 13/13 | 46s |
 | ✅ [stdin](#stdin) | Hermes's file tools send contents on stdin: must arrive byte-exact. | 1/1 | 5s |
-| ✅ [timeout](#timeout) | A command that times out is stopped, with everything it started. | 4/4 | 13s |
-| ✅ [compaction](#compaction) | Big changes don't make every later snapshot store them again. | 2/2 | 17s |
-| ✅ [export](#export) | Exports bring only plain files onto this computer. | 9/9 | 7s |
-| ✅ [isolation](#isolation) | Each chat reaches only its own sandbox. | 10/10 | 9s |
+| ✅ [timeout](#timeout) | A command that times out is stopped, with everything it started. | 4/4 | 11s |
+| ✅ [compaction](#compaction) | Big changes don't make every later snapshot store them again. | 2/2 | 14s |
+| ✅ [export](#export) | Exports bring only plain files onto this computer. | 9/9 | 5s |
+| ✅ [isolation](#isolation) | Each chat reaches only its own sandbox. | 10/10 | 7s |
 | ✅ [approval](#approval) | Commands Rewind can't undo need the user's approval first. | 18/18 | 0s |
-| ✅ [parking](#parking) | Undo history survives Hermes shutting an idle sandbox down. | 6/6 | 17s |
-| ✅ [audit](#audit) | The audit log records what happened, with secrets masked. | 5/5 | 9s |
-| ✅ [cleanup](#cleanup) | Every container and image the run created is removed. | 1/1 | 7s |
+| ✅ [parking](#parking) | Undo history survives Hermes shutting an idle sandbox down. | 6/6 | 16s |
+| ✅ [audit](#audit) | The audit log records what happened, with secrets masked. | 5/5 | 8s |
+| ✅ [cleanup](#cleanup) | Every container and image the run created is removed. | 1/1 | 5s |
 
 ## hardening
 
@@ -65,8 +65,8 @@ Every check runs real commands in real Docker sandboxes and records what the san
 
 | | Check | What happened |
 |---|---|---|
-| ✅ | rm -rf of the working directory took effect (not recreated) | after rm -rf /workspace/app (the working directory): gone |
-| ✅ | says the working directory is gone and runs in /workspace | [rewind] note: /workspace/app no longer exists, so this ran in /workspace. / pwd=/workspace |
+| ✅ | rm -rf of the working directory took effect (not recreated) | after rm -rf /workspace/app (the working directory): [rewind] note: /workspace/app no longer exists, so this ran in /workspace. |
+| ✅ | says the working directory is gone and runs in /workspace | gone / pwd=/workspace |
 | ✅ | undo brings the folder back | restored s2 (state before running: rm -rf /workspace/app); f2.txt=v2 |
 | ✅ | undo of the undo removes it again | restored s3; /workspace/app: gone |
 | ✅ | undo again is repeat-safe (same state) | /workspace/app has 3 files |
@@ -89,7 +89,7 @@ Every check runs real commands in real Docker sandboxes and records what the san
 
 | | Check | What happened |
 |---|---|---|
-| ✅ | returns soon after the limit | 4 s limit: returned after 7.6s with exit 124 |
+| ✅ | returns soon after the limit | 4 s limit: returned after 6.1s with exit 124 |
 | ✅ | reports that it was stopped | [rewind] command timed out after 4s and was stopped. |
 | ✅ | detached, setsid and nohup children are all killed | `(sleep 301 &); setsid sleep 302 & nohup sleep 303 >/dev/null 2>&1 & sleep 304`: 0 of its sleep processes left running |
 | ✅ | sandbox still works and can undo after a timeout | after undo, /workspace/w: missing |
@@ -111,7 +111,7 @@ Every check runs real commands in real Docker sandboxes and records what the san
 | ✅ | FIFOs are not created | pipe is in the skipped list |
 | ✅ | setuid bit dropped | sandbox mode 4755 -> exported mode 666 |
 | ✅ | nothing lands outside the export folder | every exported path is under the export folder |
-| ✅ | a second export never overwrites the first | first: …/20261106-163741, second: …/20261106-163742 |
+| ✅ | a second export never overwrites the first | first: …/20261106-193438, second: …/20261106-193439 |
 | ✅ | export over the size cap is refused | /workspace/huge is 3 MB, over the 2 MB export limit (REWIND_EXPORT_MAX_MB). |
 | ✅ | export of a missing path is refused | /workspace/does-not-exist does not exist in the sandbox. |
 

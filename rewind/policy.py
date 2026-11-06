@@ -45,6 +45,13 @@ _SED_S_FLAG = re.compile(r"s(.)(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[gpiImM0-9]*[
 _REDIRECT = re.compile(r"(?:\d|&)?>>?\s*(&?[^\s;&|<>]+)")
 _SEPARATORS = re.compile(r"\|\||&&|[;|&\n]")
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_FD_DUP = re.compile(r"&(?:\d+|-)")
+# Read-only commands no environment variable can make run another program.
+_NO_PROGRAM_HOOKS = frozenset({"env", "printenv", "echo", "printf", "true", "false", "pwd", "test", "[",
+                               "export", "cd", "type", "which", "sleep", "date", "id", "whoami", "uname",
+                               "hostname", "nproc", "uptime", "basename", "dirname", "seq"})
+# git options that make even a read-only subcommand write a file or run a program.
+_GIT_RISKY_OPTIONS = ("--output", "-c", "--config-env", "--exec-path", "--ext-diff", "--textconv")
 
 
 def should_snapshot(command: str, mode: str = "mutating") -> bool:
@@ -60,11 +67,12 @@ def is_mutating(command: str) -> bool:
     command = command.strip()
     if not command:
         return False
-    # Command substitution or backticks can run anything; don't try to parse it.
-    if "$(" in command or "`" in command:
+    # Command or process substitution and backticks can run anything; don't try to parse it.
+    if "$(" in command or "`" in command or "<(" in command or ">(" in command:
         return True
     for target in _REDIRECT.findall(command):
-        if not (target.startswith("&") or target == "/dev/null"):
+        # Only `>&N` / `>&-` duplicate a descriptor; bash's `>&word` writes the file `word`.
+        if not (_FD_DUP.fullmatch(target) or target == "/dev/null"):
             return True
     stripped = _REDIRECT.sub(" ", command)
     for segment in _SEPARATORS.split(stripped):
@@ -85,15 +93,23 @@ def _segment_mutates(segment: str) -> bool:
 
 
 def _words_mutate(words: list) -> bool:
+    assigned = False
     while words and (_ASSIGNMENT.match(words[0]) or words[0] in _WRAPPERS):
+        assigned = assigned or bool(_ASSIGNMENT.match(words[0]))
         words = words[1:]
     if not words:
         return False
     program = words[0].rsplit("/", 1)[-1]
+    if assigned and program not in _NO_PROGRAM_HOOKS:
+        # `NAME=value cmd`: the variable can make a read-only program run something
+        # (GIT_EXTERNAL_DIFF, PAGER, LESSOPEN, ...). Not worth guessing which.
+        return True
     args = words[1:]
     if program == "env":
         return _env_mutates(args)
     if program == "git":
+        if any(a == opt or a.startswith(opt + "=") for a in args for opt in _GIT_RISKY_OPTIONS):
+            return True
         sub = next((a for a in args if not a.startswith("-")), "")
         return sub not in READ_ONLY_GIT
     if program not in READ_ONLY_COMMANDS:
@@ -101,8 +117,10 @@ def _words_mutate(words: list) -> bool:
     if program == "sed":
         return _sed_mutates(args)
     if program == "awk":
-        # awk can run commands with system(), and gawk can edit files in place.
-        return any("system" in a or a in ("-i", "--include") or a.startswith("-i") for a in args)
+        # awk can run commands with system(), gawk can edit files in place, and a
+        # program file (-f) can do either without us seeing it.
+        return any("system" in a or a in ("-i", "--include", "-f", "--file") or a.startswith(("-i", "-f", "--file="))
+                   for a in args)
     if program == "find" and any(a in _FIND_WRITES for a in args):
         return True
     if program == "sort" and any(a == "-o" or a.startswith("--output") for a in args):
@@ -327,6 +345,8 @@ def _env_mutates(args: list) -> bool:
 def _sed_mutates(args: list) -> bool:
     for i, arg in enumerate(args):
         if arg == "-i" or arg.startswith(("-i", "--in-place")):
+            return True
+        if re.fullmatch(r"-[A-Za-z]*i\S*", arg):  # -i inside a cluster: -ni, -Ei, -nEi.bak
             return True
         if arg in ("-f", "--file") or arg.startswith("--file="):
             return True  # the script is in a file we can't inspect
