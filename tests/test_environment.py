@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 import time
 import unittest
@@ -22,6 +23,8 @@ class FakeDocker:
         self.image_info = {}  # image -> "size layers" for `docker image inspect`
         self.guard_fails = False
         self.guard_image_present = True
+        self.kill_fails = False
+        self.kill_scripts = []
 
     def __call__(self, argv, timeout=None):
         assert argv[0] == "docker"
@@ -38,6 +41,9 @@ class FakeDocker:
         if verb == "exec":
             if argv[-1] == "command -v bash":
                 return 0, "/bin/bash\n"
+            if "REWIND_KILL_OK" in argv[-1]:
+                self.kill_scripts.append(argv[-1])
+                return (1, "") if self.kill_fails else (0, "REWIND_KILL_OK\n")
             if self.timeout_exec:
                 raise subprocess.TimeoutExpired(argv, timeout, output=b"partial")
             return self.exec_code, f"{self.exec_output}\n{_CWD_MARKER}{self.exec_cwd}\n"
@@ -143,6 +149,33 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(result["exit_code"], 124)
         self.assertIn("partial", result["output"])
         self.assertIn("timed out after 5s", result["output"])
+
+    def test_timed_out_command_is_stopped_in_the_container(self):
+        env = make_env(self.fake)
+        self.fake.timeout_exec = True
+        result = env.execute("sleep 999", timeout=5)
+        self.assertIn("was stopped", result["output"])
+        # The kill targets the PID file this very command's wrapper wrote.
+        run = [c for c in self.fake.calls if c[1] == "exec" and "sleep 999" in c[-1]][-1][-1]
+        pid_file = re.search(r"echo \$\$ > (\S+)", run).group(1)
+        self.assertIn(f"f={pid_file}", self.fake.kill_scripts[-1])
+        self.assertIn("kill -KILL", self.fake.kill_scripts[-1])
+
+    def test_no_background_snapshot_while_a_timed_out_command_may_still_run(self):
+        env = make_env(self.fake, background=True)
+        self.fake.timeout_exec = True
+        self.fake.kill_fails = True
+        commits = self.fake.verbs().count("commit")
+        result = env.execute("sleep 999", timeout=5)
+        env._finish_background()
+        self.assertIn("could not be stopped", result["output"])
+        self.assertEqual(self.fake.verbs().count("commit"), commits)
+        self.assertIsNone(env._pending)
+        # Once the command is confirmed stopped, the next state is captured again.
+        self.fake.kill_fails = False
+        env.execute("sleep 999", timeout=5)
+        env._finish_background()
+        self.assertGreater(self.fake.verbs().count("commit"), commits)
 
     def test_snapshot_failure_warns_but_still_runs(self):
         env = make_env(self.fake)
@@ -497,6 +530,28 @@ class ToolTests(unittest.TestCase):
         # each session's own task_id. Hermes's own terminal tool uses it too.
         RewindEnvironment(task_id="default", runner=self.fake, background=False)
         self.assertTrue(self.call("rewind_list", task_id="session-123")["ok"])
+
+    def test_shared_sandbox_is_not_reachable_from_messaging_platforms(self):
+        # A Telegram chat with no sandbox of its own (none yet, or parked) must
+        # not fall through to the local user's shared sandbox.
+        class Ctx:
+            def session_surface(self):
+                return "telegram"
+
+        shared = RewindEnvironment(task_id="default", runner=self.fake, background=False)
+        shared.execute("rm a")
+        old, tools._CTX = tools._CTX, Ctx()
+        try:
+            for name, args in (("rewind_list", {}), ("rewind_changes", {}),
+                               ("rewind_restore", {"snapshot_id": "s1"}), ("rewind_undo", {})):
+                result = self.call(name, args, task_id="telegram-chat", session_id="telegram-chat")
+                self.assertFalse(result["ok"], name)
+                self.assertIn("no Rewind sandbox", result["error"])
+            # The chat's own sandbox still works.
+            RewindEnvironment(task_id="telegram-chat", runner=self.fake, background=False)
+            self.assertTrue(self.call("rewind_list", task_id="telegram-chat")["ok"])
+        finally:
+            tools._CTX = old
 
     def test_tools_without_sandbox_return_error(self):
         result = self.call("rewind_list")
