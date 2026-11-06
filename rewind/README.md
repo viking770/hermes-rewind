@@ -2,6 +2,8 @@
 
 [![tests](https://github.com/viking770/hermes-rewind/actions/workflows/tests.yml/badge.svg)](https://github.com/viking770/hermes-rewind/actions/workflows/tests.yml)
 
+**Stress-tested against real Docker:** 99 attacks on every protection below, from fork bombs and memory hogs to reaching this computer through the firewall, with what the sandbox did each time: [stress test report](https://github.com/viking770/hermes-rewind/blob/main/docs/stress-report.md).
+
 Rewind is a [Hermes Agent](https://hermes-agent.nousresearch.com) terminal backend. It runs every command in a Docker sandbox and **snapshots the sandbox before any command that can change files**. If the agent deletes the wrong folder, breaks a dependency or ruins a refactor, you or the agent can roll back in one step.
 
 ```
@@ -156,7 +158,7 @@ To give yourself longer before Hermes shuts an idle sandbox down, raise Hermes's
 ```bash
 python3 -m unittest discover -s tests -t .                                  # unit tests, no Docker needed
 REWIND_INTEGRATION=1 python3 -m unittest tests.test_docker_integration -v  # real Docker
-python3 scripts/stress_test.py   # ~100 attacks on every protection, real Docker (--list for sections)
+python3 scripts/stress_test.py   # ~100 attacks on every protection, real Docker; writes stress-report.md/.json
 hermes plugins validate ./rewind --install-deps
 python3 scripts/dev_install.py   # copy into Hermes and restart the gateway
 python3 scripts/e2e_hermes.py    # scripted chat with a real model; checks the tool results

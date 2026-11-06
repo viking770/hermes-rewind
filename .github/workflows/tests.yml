@@ -52,7 +52,15 @@ jobs:
           REWIND_INTEGRATION: "1"
         run: python -m unittest tests.test_docker_integration -v
       - name: Stress test (attacks every protection)
-        run: python scripts/stress_test.py
+        # Also writes the results table to this run's summary page.
+        run: python scripts/stress_test.py --report stress-report
+      - name: Keep the stress-test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-report
+          path: stress-report.*
+          if-no-files-found: ignore
       - name: No sandboxes left behind
         if: always()
         run: |

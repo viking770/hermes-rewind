@@ -1,0 +1,621 @@
+{
+  "date": "2026-11-06 11:08 UTC",
+  "rewind": "0.2.4",
+  "commit": "d0cf4eb",
+  "docker": "29.9.1 (linux/amd64)",
+  "host": "Windows 11",
+  "python": "3.14.9",
+  "seconds": 257.5,
+  "passed": 99,
+  "total": 99,
+  "section_seconds": {
+    "hardening": 17.4,
+    "network": 40.6,
+    "undo": 114.9,
+    "stdin": 4.8,
+    "timeout": 12.9,
+    "compaction": 16.9,
+    "export": 7.1,
+    "isolation": 9.5,
+    "approval": 0.0,
+    "parking": 17.5,
+    "audit": 8.9,
+    "cleanup": 7.0
+  },
+  "results": [
+    {
+      "section": "hardening",
+      "check": "only the 5 package-manager capabilities",
+      "ok": true,
+      "evidence": "CapEff=0xcb (expected 0xcb: CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID)"
+    },
+    {
+      "section": "hardening",
+      "check": "no NET_ADMIN or NET_RAW (firewall can't be changed from inside)",
+      "ok": true,
+      "evidence": "bits 12 and 13 of CapEff=0xcb are clear"
+    },
+    {
+      "section": "hardening",
+      "check": "no SYS_ADMIN",
+      "ok": true,
+      "evidence": "bit 21 of CapEff=0xcb is clear"
+    },
+    {
+      "section": "hardening",
+      "check": "no-new-privileges is set",
+      "ok": true,
+      "evidence": "NoNewPrivs: 1"
+    },
+    {
+      "section": "hardening",
+      "check": "can't mount filesystems",
+      "ok": true,
+      "evidence": "mount -t tmpfs: mount: /mnt: permission denied."
+    },
+    {
+      "section": "hardening",
+      "check": "raw sockets refused",
+      "ok": true,
+      "evidence": "SOCK_RAW: PermissionError: [Errno 1] Operation not permitted"
+    },
+    {
+      "section": "hardening",
+      "check": "Docker socket not mounted",
+      "ok": true,
+      "evidence": "/var/run/docker.sock: absent"
+    },
+    {
+      "section": "hardening",
+      "check": "no host environment passed in",
+      "ok": true,
+      "evidence": "variables in the sandbox: GPG_KEY HOME HOSTNAME LANG OLDPWD PATH PWD PYTHON_SHA256 PYTHON_VERSION SHLVL _"
+    },
+    {
+      "section": "hardening",
+      "check": "process limit is 2048",
+      "ok": true,
+      "evidence": "pids.max=2048"
+    },
+    {
+      "section": "hardening",
+      "check": "memory limit is 5 GB",
+      "ok": true,
+      "evidence": "memory.max=5368709120"
+    },
+    {
+      "section": "hardening",
+      "check": "CPU limit is 1 CPU",
+      "ok": true,
+      "evidence": "cpu.max=100000 100000"
+    },
+    {
+      "section": "hardening",
+      "check": "fork bomb stops at the process limit",
+      "ok": true,
+      "evidence": "tried 500 forks with a 64-process limit: stopped: Resource temporarily unavailable, forked 60"
+    },
+    {
+      "section": "hardening",
+      "check": "memory hog is killed at the memory limit",
+      "ok": true,
+      "evidence": "allocating 400 MB with a 128 MB limit: exit 137 (array(400*1024*1024); print('\"'\"'ALLOC'\"'\"'+'\"'\"'ATED'\"'\"')')"
+    },
+    {
+      "section": "hardening",
+      "check": "sandbox survives both",
+      "ok": true,
+      "evidence": "next command printed: alive"
+    },
+    {
+      "section": "network",
+      "check": "guard installed (no fallback warning)",
+      "ok": true,
+      "evidence": "first command printed: up"
+    },
+    {
+      "section": "network",
+      "check": "internet reachable (HTTPS)",
+      "ok": true,
+      "evidence": "GET https://example.com -> 200"
+    },
+    {
+      "section": "network",
+      "check": "DNS works",
+      "ok": true,
+      "evidence": "example.com resolves to 172.66.147.243"
+    },
+    {
+      "section": "network",
+      "check": "sandbox gateway 172.17.0.1 blocked",
+      "ok": true,
+      "evidence": "connect 172.17.0.1:80 -> connection refused"
+    },
+    {
+      "section": "network",
+      "check": "cloud metadata 169.254.169.254 blocked",
+      "ok": true,
+      "evidence": "connect 169.254.169.254:80 -> connection refused"
+    },
+    {
+      "section": "network",
+      "check": "LAN 10.0.0.1 blocked",
+      "ok": true,
+      "evidence": "connect 10.0.0.1:22 -> connection refused"
+    },
+    {
+      "section": "network",
+      "check": "LAN 192.168.0.1 blocked",
+      "ok": true,
+      "evidence": "connect 192.168.0.1:80 -> connection refused"
+    },
+    {
+      "section": "network",
+      "check": "LAN 172.16.0.1 blocked",
+      "ok": true,
+      "evidence": "connect 172.16.0.1:80 -> connection refused"
+    },
+    {
+      "section": "network",
+      "check": "carrier NAT 100.64.0.1 blocked",
+      "ok": true,
+      "evidence": "connect 100.64.0.1:80 -> connection refused"
+    },
+    {
+      "section": "network",
+      "check": "this computer (own address #1) blocked",
+      "ok": true,
+      "evidence": "connect own address #1:445 -> connection refused"
+    },
+    {
+      "section": "network",
+      "check": "this computer (own address #6) blocked",
+      "ok": true,
+      "evidence": "connect own address #6:445 -> connection refused"
+    },
+    {
+      "section": "network",
+      "check": "host.docker.internal (192.168.65.254) blocked",
+      "ok": true,
+      "evidence": "connect 192.168.65.254:80 -> connection refused"
+    },
+    {
+      "section": "network",
+      "check": "the sandbox's own loopback still works",
+      "ok": true,
+      "evidence": "connect 127.0.0.1:8765 -> connected (a server inside the sandbox)"
+    },
+    {
+      "section": "network",
+      "check": "NAT64 to 10.0.0.1 blocked",
+      "ok": true,
+      "evidence": "connect 64:ff9b::a00:1:80 -> network unreachable"
+    },
+    {
+      "section": "network",
+      "check": "IPv6 ULA fd00::1 blocked",
+      "ok": true,
+      "evidence": "connect fd00::1:80 -> network unreachable"
+    },
+    {
+      "section": "network",
+      "check": "network=none has no internet",
+      "ok": true,
+      "evidence": "connect 1.1.1.1:443 -> network unreachable"
+    },
+    {
+      "section": "undo",
+      "check": "rm -rf of the working directory took effect (not recreated)",
+      "ok": true,
+      "evidence": "after rm -rf /workspace/app (the working directory): gone"
+    },
+    {
+      "section": "undo",
+      "check": "says the working directory is gone and runs in /workspace",
+      "ok": true,
+      "evidence": "[rewind] note: /workspace/app no longer exists, so this ran in /workspace. / pwd=/workspace"
+    },
+    {
+      "section": "undo",
+      "check": "undo brings the folder back",
+      "ok": true,
+      "evidence": "restored s2 (state before running: rm -rf /workspace/app); f2.txt=v2"
+    },
+    {
+      "section": "undo",
+      "check": "undo of the undo removes it again",
+      "ok": true,
+      "evidence": "restored s3; /workspace/app: gone"
+    },
+    {
+      "section": "undo",
+      "check": "undo again is repeat-safe (same state)",
+      "ok": true,
+      "evidence": "/workspace/app has 3 files"
+    },
+    {
+      "section": "undo",
+      "check": "read-only commands take no snapshot",
+      "ok": true,
+      "evidence": "6 read-only commands: snapshots 5 -> 5"
+    },
+    {
+      "section": "undo",
+      "check": "changes outside /workspace are restored too",
+      "ok": true,
+      "evidence": "/etc/rewind-outside=outside"
+    },
+    {
+      "section": "undo",
+      "check": "preview changes nothing",
+      "ok": true,
+      "evidence": "preview of s10 listed 1 change(s); p.txt still=after"
+    },
+    {
+      "section": "undo",
+      "check": "history is capped at max_snapshots",
+      "ok": true,
+      "evidence": "after 10 more changes: 6 automatic snapshots kept (max_snapshots=6)"
+    },
+    {
+      "section": "undo",
+      "check": "pruned snapshots' images are deleted",
+      "ok": true,
+      "evidence": "11 images for 10 snapshots"
+    },
+    {
+      "section": "undo",
+      "check": "cd carries over between commands",
+      "ok": true,
+      "evidence": "next command's pwd=/workspace/deep/dir"
+    },
+    {
+      "section": "undo",
+      "check": "restore brings back the working directory",
+      "ok": true,
+      "evidence": "pwd after undo=/workspace/deep/dir"
+    },
+    {
+      "section": "undo",
+      "check": "secrets typed in commands are masked in snapshot history",
+      "ok": true,
+      "evidence": "recorded as: GITHUB_TOKEN=[REDACTED] touch /workspace/tok"
+    },
+    {
+      "section": "stdin",
+      "check": "300 KB payload arrives byte-exact",
+      "ok": true,
+      "evidence": "sent 300,049 bytes (Unicode, quotes, $, backticks); sha256 b114846be54b1530… vs b114846be54b1530…"
+    },
+    {
+      "section": "timeout",
+      "check": "returns soon after the limit",
+      "ok": true,
+      "evidence": "4 s limit: returned after 7.6s with exit 124"
+    },
+    {
+      "section": "timeout",
+      "check": "reports that it was stopped",
+      "ok": true,
+      "evidence": "[rewind] command timed out after 4s and was stopped."
+    },
+    {
+      "section": "timeout",
+      "check": "detached, setsid and nohup children are all killed",
+      "ok": true,
+      "evidence": "`(sleep 301 &); setsid sleep 302 & nohup sleep 303 >/dev/null 2>&1 & sleep 304`: 0 of its sleep processes left running"
+    },
+    {
+      "section": "timeout",
+      "check": "sandbox still works and can undo after a timeout",
+      "ok": true,
+      "evidence": "after undo, /workspace/w: missing"
+    },
+    {
+      "section": "compaction",
+      "check": "compaction keeps the layer count bounded",
+      "ok": true,
+      "evidence": "4 x 3 MB changes with compact_mb=1: newest snapshot has 8 layers"
+    },
+    {
+      "section": "compaction",
+      "check": "a snapshot from before compaction still restores",
+      "ok": true,
+      "evidence": "restored s2: 1 blob(s) present, as at that point"
+    },
+    {
+      "section": "export",
+      "check": "plain file exported",
+      "ok": true,
+      "evidence": "arrived: hardlink.txt, ok.txt, suid"
+    },
+    {
+      "section": "export",
+      "check": "symlinks are not created on this computer",
+      "ok": true,
+      "evidence": "skipped: out/link-to-host, out/link-to-passwd, out/pipe"
+    },
+    {
+      "section": "export",
+      "check": "both names of a hard-linked file arrive as plain files",
+      "ok": true,
+      "evidence": "ok.txt and hardlink.txt both contain 'hello'"
+    },
+    {
+      "section": "export",
+      "check": "FIFOs are not created",
+      "ok": true,
+      "evidence": "pipe is in the skipped list"
+    },
+    {
+      "section": "export",
+      "check": "setuid bit dropped",
+      "ok": true,
+      "evidence": "sandbox mode 4755 -> exported mode 666"
+    },
+    {
+      "section": "export",
+      "check": "nothing lands outside the export folder",
+      "ok": true,
+      "evidence": "every exported path is under the export folder"
+    },
+    {
+      "section": "export",
+      "check": "a second export never overwrites the first",
+      "ok": true,
+      "evidence": "first: …/20261106-163741, second: …/20261106-163742"
+    },
+    {
+      "section": "export",
+      "check": "export over the size cap is refused",
+      "ok": true,
+      "evidence": "/workspace/huge is 3 MB, over the 2 MB export limit (REWIND_EXPORT_MAX_MB)."
+    },
+    {
+      "section": "export",
+      "check": "export of a missing path is refused",
+      "ok": true,
+      "evidence": "/workspace/does-not-exist does not exist in the sandbox."
+    },
+    {
+      "section": "isolation",
+      "check": "a chat's tools see its own snapshots",
+      "ok": true,
+      "evidence": "rewind_list for alice: 1 snapshot(s), all alice's"
+    },
+    {
+      "section": "isolation",
+      "check": "an unknown chat gets no sandbox, not someone else's",
+      "ok": true,
+      "evidence": "This session has no Rewind sandbox yet. Run a terminal command first (and check `hermes config get terminal.backend` says rewind)."
+    },
+    {
+      "section": "isolation",
+      "check": "Telegram chat can't reach the shared sandbox (rewind_list)",
+      "ok": true,
+      "evidence": "This session has no Rewind sandbox yet. Run a terminal command first (and check `hermes config get terminal.backend` say"
+    },
+    {
+      "section": "isolation",
+      "check": "Telegram chat can't reach the shared sandbox (rewind_changes)",
+      "ok": true,
+      "evidence": "This session has no Rewind sandbox yet. Run a terminal command first (and check `hermes config get terminal.backend` say"
+    },
+    {
+      "section": "isolation",
+      "check": "Telegram chat can't reach the shared sandbox (rewind_undo)",
+      "ok": true,
+      "evidence": "This session has no Rewind sandbox yet. Run a terminal command first (and check `hermes config get terminal.backend` say"
+    },
+    {
+      "section": "isolation",
+      "check": "rewind_export refused from a messaging platform",
+      "ok": true,
+      "evidence": "rewind_export writes to the Hermes host's disk, so it is only available in local chats (this one is on telegram). Show t"
+    },
+    {
+      "section": "isolation",
+      "check": "/rewind undo from Telegram can't touch the shared sandbox",
+      "ok": true,
+      "evidence": "Rewind: This chat has no Rewind sandbox yet: run a terminal command first."
+    },
+    {
+      "section": "isolation",
+      "check": "shared sandbox untouched",
+      "ok": true,
+      "evidence": "/workspace/precious=local-user-work"
+    },
+    {
+      "section": "isolation",
+      "check": "/rewind export refused from Discord",
+      "ok": true,
+      "evidence": "Rewind: /rewind export writes to the Hermes host's disk, so it only works from a local chat (CLI, TUI or desktop app), n"
+    },
+    {
+      "section": "isolation",
+      "check": "the shared sandbox is reachable from a local chat",
+      "ok": true,
+      "evidence": "rewind_list from the CLI: ok=True"
+    },
+    {
+      "section": "approval",
+      "check": "asks before: git push origin main",
+      "ok": true,
+      "evidence": "Rewind can't undo this: `git push` sends commits outside the sandbox. Snapshots only cover the sandbox's files. Run it?"
+    },
+    {
+      "section": "approval",
+      "check": "asks before: npm publish",
+      "ok": true,
+      "evidence": "Rewind can't undo this: `npm publish` changes a remote service. Snapshots only cover the sandbox's files. Run it?"
+    },
+    {
+      "section": "approval",
+      "check": "asks before: docker push me/img",
+      "ok": true,
+      "evidence": "Rewind can't undo this: `docker push` changes a remote service. Snapshots only cover the sandbox's files. Run it?"
+    },
+    {
+      "section": "approval",
+      "check": "asks before: curl -X POST https://x.io/hook -d @f",
+      "ok": true,
+      "evidence": "Rewind can't undo this: `curl` sends an HTTP POST request. Snapshots only cover the sandbox's files. Run it?"
+    },
+    {
+      "section": "approval",
+      "check": "asks before: bash -c 'git push'",
+      "ok": true,
+      "evidence": "Rewind can't undo this: `git push` sends commits outside the sandbox. Snapshots only cover the sandbox's files. Run it?"
+    },
+    {
+      "section": "approval",
+      "check": "asks before: eval \"git push\"",
+      "ok": true,
+      "evidence": "Rewind can't undo this: `git push` sends commits outside the sandbox. Snapshots only cover the sandbox's files. Run it?"
+    },
+    {
+      "section": "approval",
+      "check": "asks before: git -C repo push",
+      "ok": true,
+      "evidence": "Rewind can't undo this: `git push` sends commits outside the sandbox. Snapshots only cover the sandbox's files. Run it?"
+    },
+    {
+      "section": "approval",
+      "check": "asks before: kubectl apply -f k.yaml",
+      "ok": true,
+      "evidence": "Rewind can't undo this: `kubectl apply` changes a cluster outside the sandbox. Snapshots only cover the sandbox's files. Run it?"
+    },
+    {
+      "section": "approval",
+      "check": "asks before: ssh prod 'rm -rf /srv'",
+      "ok": true,
+      "evidence": "Rewind can't undo this: `ssh` runs commands on another machine or database. Snapshots only cover the sandbox's files. Run it?"
+    },
+    {
+      "section": "approval",
+      "check": "asks before: python3 -c 'import requests; requests.post('\"'\"'",
+      "ok": true,
+      "evidence": "Rewind can't undo this: a script calls `requests.post`, which sends data outside the sandbox. Snapshots only cover the sandbox's files. Run"
+    },
+    {
+      "section": "approval",
+      "check": "no prompt for: ls -la",
+      "ok": true,
+      "evidence": "no prompt"
+    },
+    {
+      "section": "approval",
+      "check": "no prompt for: cat README.md",
+      "ok": true,
+      "evidence": "no prompt"
+    },
+    {
+      "section": "approval",
+      "check": "no prompt for: git status",
+      "ok": true,
+      "evidence": "no prompt"
+    },
+    {
+      "section": "approval",
+      "check": "no prompt for: pip install requests",
+      "ok": true,
+      "evidence": "no prompt"
+    },
+    {
+      "section": "approval",
+      "check": "no prompt for: python3 app.py",
+      "ok": true,
+      "evidence": "no prompt"
+    },
+    {
+      "section": "approval",
+      "check": "asks through the tool-search bridge too",
+      "ok": true,
+      "evidence": "Rewind can't undo this: `git push` sends commits outside the sandbox. Snapshots only cover the sandbox's files. Run it?"
+    },
+    {
+      "section": "approval",
+      "check": "asks before an export",
+      "ok": true,
+      "evidence": "The agent wants to copy '/workspace' out of the Rewind sandbox onto this computer (into ~\\AppData\\Local\\Tem"
+    },
+    {
+      "section": "approval",
+      "check": "no prompt when the sandbox has no network",
+      "ok": true,
+      "evidence": "git push with REWIND_NETWORK=none: no prompt (it can't reach anything)"
+    },
+    {
+      "section": "parking",
+      "check": "idle shutdown parks the snapshots",
+      "ok": true,
+      "evidence": "record status=parked, 2 snapshot(s)"
+    },
+    {
+      "section": "parking",
+      "check": "no container left running while parked",
+      "ok": true,
+      "evidence": "docker ps finds none"
+    },
+    {
+      "section": "parking",
+      "check": "next sandbox resumes the history",
+      "ok": true,
+      "evidence": "[rewind] Resumed this session's sandbox from 0s ago with 2 snapshot(s); earlier changes can still be undone."
+    },
+    {
+      "section": "parking",
+      "check": "undo works across the shutdown",
+      "ok": true,
+      "evidence": "kept.txt after undo=kept"
+    },
+    {
+      "section": "parking",
+      "check": "a tampered record is ignored (starts fresh)",
+      "ok": true,
+      "evidence": "record edited to base_image='--privileged': started fresh with 0 snapshots"
+    },
+    {
+      "section": "parking",
+      "check": "tampered image name never reaches docker",
+      "ok": true,
+      "evidence": "started from hermes-rewind-base:1"
+    },
+    {
+      "section": "audit",
+      "check": "audit log has 'undo' events",
+      "ok": true,
+      "evidence": "1 of 19 entries"
+    },
+    {
+      "section": "audit",
+      "check": "audit log has 'approval_requested' events",
+      "ok": true,
+      "evidence": "13 of 19 entries"
+    },
+    {
+      "section": "audit",
+      "check": "audit log has 'command_timeout' events",
+      "ok": true,
+      "evidence": "2 of 19 entries"
+    },
+    {
+      "section": "audit",
+      "check": "the approval request itself is logged",
+      "ok": true,
+      "evidence": "approval_requested written for the git push"
+    },
+    {
+      "section": "audit",
+      "check": "secrets are masked in the audit log",
+      "ok": true,
+      "evidence": "logged command: TOKEN=[REDACTED] git push"
+    },
+    {
+      "section": "cleanup",
+      "check": "no stress-test containers left behind",
+      "ok": true,
+      "evidence": "docker ps finds no stress-test containers"
+    }
+  ]
+}
