@@ -187,6 +187,33 @@ class NetworkGuardTests(unittest.TestCase):
         # Each IPv6 rule is its own line, so `set -e` catches any that fails.
         self.assertNotIn("&& ip6tables", script)
 
+    def test_host_addresses_never_stall_a_sandbox_start(self):
+        # macOS can take ~30 s to resolve its own hostname; the guard runs on every start.
+        from unittest import mock
+        from rewind import environment
+        saved = environment._host_cache
+        environment._host_cache = (0.0, [])
+        calls = []
+
+        def slow_lookup(*args, **kwargs):
+            calls.append(1)
+            time.sleep(5)
+            return [(None, None, None, None, ("203.0.113.50", 0))]
+
+        try:
+            with mock.patch.object(environment, "_HOSTNAME_LOOKUP_SECONDS", 0.2), \
+                    mock.patch.object(environment.socket, "getaddrinfo", slow_lookup):
+                started = time.monotonic()
+                first = environment.host_addresses()
+                self.assertLess(time.monotonic() - started, 2)
+                self.assertNotIn("203.0.113.50", first)  # gave up on the slow lookup
+                started = time.monotonic()
+                self.assertEqual(environment.host_addresses(), first)  # cached
+                self.assertLess(time.monotonic() - started, 0.1)
+                self.assertEqual(len(calls), 1)
+        finally:
+            environment._host_cache = saved
+
     def test_default_gateway_is_read_from_the_route_table(self):
         from rewind.environment import _default_gateways
         table = ("Iface\tDestination\tGateway \tFlags\n"

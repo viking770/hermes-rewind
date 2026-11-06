@@ -112,28 +112,56 @@ def _clean_addresses(addresses: Sequence[str]) -> List[str]:
     return out
 
 
+_HOST_CACHE_SECONDS = 300.0
+_HOSTNAME_LOOKUP_SECONDS = 1.0
+_host_cache: Tuple[float, List[str]] = (0.0, [])
+_host_cache_lock = threading.Lock()
+
+
+def _hostname_addresses(timeout: float) -> List[str]:
+    """Addresses the hostname resolves to, giving up after ``timeout``: on macOS
+    resolving the machine's own name can block for ~30 s (an mDNS timeout),
+    and this runs on every sandbox start."""
+    found: List[str] = []
+
+    def work() -> None:
+        try:
+            found.extend(info[4][0] for info in socket.getaddrinfo(socket.gethostname(), None))
+        except (OSError, UnicodeError):
+            pass
+
+    worker = threading.Thread(target=work, name="rewind-hostname", daemon=True)
+    worker.start()
+    worker.join(timeout)
+    return list(found) if not worker.is_alive() else []
+
+
 def host_addresses() -> List[str]:
     """This computer's own addresses, as seen by the plugin process.
 
     On a server with a public IP, the blocked private ranges don't cover the
     host itself: a sandbox could reach anything listening on 0.0.0.0 (Hermes's
     gateway, databases, admin panels) through that public address. Found from
-    the hostname and from the source address the system would use to reach
-    the internet (a UDP connect, which sends no packets)."""
-    found: List[str] = []
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None):
-            found.append(info[4][0])
-    except OSError:
-        pass
-    for family, probe in ((socket.AF_INET, "192.0.2.1"), (socket.AF_INET6, "2001:db8::1")):
-        try:
-            with socket.socket(family, socket.SOCK_DGRAM) as sock:
-                sock.connect((probe, 9))
-                found.append(sock.getsockname()[0])
-        except OSError:
-            pass
-    return _clean_addresses(found)
+    the source address the system would use to reach the internet (a UDP
+    connect, which sends no packets and returns at once) and from the hostname
+    (time-boxed). Cached for a few minutes: the guard runs on every restart."""
+    global _host_cache
+    with _host_cache_lock:
+        cached_at, cached = _host_cache
+        if cached and time.monotonic() - cached_at < _HOST_CACHE_SECONDS:
+            return list(cached)
+        found: List[str] = []
+        for family, probe in ((socket.AF_INET, "192.0.2.1"), (socket.AF_INET6, "2001:db8::1")):
+            try:
+                with socket.socket(family, socket.SOCK_DGRAM) as sock:
+                    sock.connect((probe, 9))
+                    found.append(sock.getsockname()[0])
+            except OSError:
+                pass
+        found += _hostname_addresses(_HOSTNAME_LOOKUP_SECONDS)
+        result = _clean_addresses(found)
+        _host_cache = (time.monotonic(), result)
+        return list(result)
 
 
 def _guard_script(nameservers: Sequence[str], host_ips: Sequence[str] = ()) -> str:
