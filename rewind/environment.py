@@ -153,7 +153,9 @@ def host_addresses() -> List[str]:
     global _host_cache
     with _host_cache_lock:
         cached_at, cached = _host_cache
-        if cached and time.monotonic() - cached_at < _HOST_CACHE_SECONDS:
+        # An empty result is cached too (no network, say): otherwise every sandbox
+        # start would wait out the hostname lookup again.
+        if cached_at and time.monotonic() - cached_at < _HOST_CACHE_SECONDS:
             return list(cached)
         found: List[str] = []
         for family, probe in ((socket.AF_INET, "192.0.2.1"), (socket.AF_INET6, "2001:db8::1")):
@@ -1199,6 +1201,23 @@ def _owner_only(path: Path, executable: bool = False) -> None:
         os.chmod(path, 0o700 if executable else 0o600)
 
 
+def _make_dirs(path: Path, root: Path) -> None:
+    """Create ``path`` and any missing folders between ``root`` and it, each
+    owner-only: a file's folders aren't always their own archive entries
+    (`app/` for `app/run.sh`), and mkdir(parents=True) would leave those at
+    the default, readable-by-everyone permissions."""
+    missing = []
+    current = path
+    while current != root and root in current.parents and not current.exists():
+        missing.append(current)
+        current = current.parent
+    for folder in reversed(missing):
+        folder.mkdir(exist_ok=True)
+        _owner_only(folder, executable=True)
+    if path.is_dir() and path not in missing and path != root:
+        _owner_only(path, executable=True)  # a folder entry for one already made
+
+
 def _mark_downloaded(path: Path) -> None:
     """On Windows, add the "downloaded from the internet" mark (Mark of the Web),
     so SmartScreen and Office Protected View treat the file as coming from the
@@ -1258,8 +1277,7 @@ def _extract_plain(stream, dest: Path, max_mb: int = 0, max_files: int = 0,
                                       "(REWIND_EXPORT_MAX_FILES).")
             try:
                 if member.isdir():
-                    target.mkdir(parents=True, exist_ok=True)
-                    _owner_only(target, executable=True)
+                    _make_dirs(target, root)
                 elif member.isfile() or member.islnk():
                     original = None
                     if member.islnk():
@@ -1271,7 +1289,7 @@ def _extract_plain(stream, dest: Path, max_mb: int = 0, max_files: int = 0,
                     size = original.stat().st_size if original is not None else member.size
                     if cap and written + size > cap:
                         raise RewindError(f"The export is bigger than the {max_mb} MB limit.")
-                    target.parent.mkdir(parents=True, exist_ok=True)
+                    _make_dirs(target.parent, root)
                     if target.exists():
                         skip(shown, "exists")
                         continue
