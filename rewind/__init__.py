@@ -5,7 +5,7 @@ Enable with:
     hermes config set terminal.backend rewind
 
 Optional settings (environment variables):
-    REWIND_IMAGE          base image (default python:3.12-slim)
+    REWIND_IMAGE          base image (default hermes-rewind-base:1: pinned python:3.12-slim + git, curl)
     REWIND_SNAPSHOT_MODE  mutating | always | off (default mutating)
     REWIND_MAX_SNAPSHOTS  automatic snapshots to keep (default 25)
     REWIND_NETWORK        internet (default; this computer and the LAN are blocked), none, or full

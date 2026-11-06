@@ -5,7 +5,9 @@ import time
 import unittest
 
 from rewind import RewindProvider, registry, tools
-from rewind.environment import DEFAULT_IMAGE, GUARD_IMAGE, RewindEnvironment, RewindError, _CWD_MARKER
+from rewind.environment import (
+    DEFAULT_IMAGE, GUARD_IMAGE, SLIM_IMAGE, TOOLS_IMAGE, RewindEnvironment, RewindError, _CWD_MARKER,
+)
 
 
 class FakeDocker:
@@ -23,6 +25,7 @@ class FakeDocker:
         self.image_info = {}  # image -> "size layers" for `docker image inspect`
         self.guard_fails = False
         self.guard_image_present = True
+        self.tools_image_present = True
         self.kill_fails = False
         self.kill_scripts = []
 
@@ -38,6 +41,11 @@ class FakeDocker:
             return (1, "iptables: not supported") if self.guard_fails else (0, "REWIND_GUARD_OK\n")
         if verb == "image" and argv[2] == "inspect" and argv[-1] == GUARD_IMAGE and self.guard_image_present:
             return 0, "100 3\n"
+        if verb == "image" and argv[2] == "inspect" and argv[-1] == TOOLS_IMAGE and self.tools_image_present:
+            return 0, "200 4\n"
+        if verb == "build" and TOOLS_IMAGE in argv:
+            self.tools_image_present = True
+            return 0, ""
         if verb == "exec":
             if argv[-1] == "command -v bash":
                 return 0, "/bin/bash\n"
@@ -69,6 +77,8 @@ def make_env(fake, **kw):
     # of its own, so it is off here and tested in test_security.py.
     kw.setdefault("background", False)
     kw.setdefault("network", "none")
+    # Call-order tests count docker calls; the default image's build check has its own tests.
+    kw.setdefault("image", SLIM_IMAGE)
     return RewindEnvironment(task_id="Demo Task", runner=fake, **kw)
 
 
@@ -596,8 +606,52 @@ class ToolTests(unittest.TestCase):
         env = RewindProvider().create_environment(cwd="~", timeout=30, task_id="t1", image="")
         self.assertEqual(env.cwd, "/workspace")
         self.assertEqual(env.base_image, DEFAULT_IMAGE)
-        self.assertIn("@sha256:", env.base_image)  # pinned
+        self.assertEqual(DEFAULT_IMAGE, TOOLS_IMAGE)
+        self.assertIn("@sha256:", SLIM_IMAGE)  # what it's built from is pinned
         self.assertIs(registry.get("t1"), env)
+
+
+class DefaultImageTests(unittest.TestCase):
+    """The default sandbox has git and curl, so a fresh one can clone a repo."""
+
+    def setUp(self):
+        registry.clear()
+        self.fake = FakeDocker()
+
+    def sandbox_image(self):
+        run = [c for c in self.fake.calls if c[1] == "run" and "-d" in c][-1]
+        return run[run.index("--entrypoint") + 2]
+
+    def test_default_image_is_built_once_from_the_pinned_slim_image(self):
+        from rewind.environment import _TOOLS_DOCKERFILE
+        self.assertTrue(_TOOLS_DOCKERFILE.startswith(f"FROM {SLIM_IMAGE}\n"))
+        for package in ("git", "curl", "ca-certificates"):
+            self.assertIn(f" {package}", _TOOLS_DOCKERFILE)
+        self.fake.tools_image_present = False
+        env = make_env(self.fake, image=DEFAULT_IMAGE)
+        result = env.execute("git --version")
+        self.assertEqual(self.sandbox_image(), TOOLS_IMAGE)
+        self.assertIn("First run on this machine", result["output"])
+        self.assertEqual(self.fake.verbs().count("build"), 1)
+        # A second sandbox finds it and doesn't build again.
+        make_env(self.fake, image=DEFAULT_IMAGE).execute("ls")
+        self.assertEqual(self.fake.verbs().count("build"), 1)
+
+    def test_falls_back_to_the_slim_image_when_the_build_fails(self):
+        self.fake.tools_image_present = False
+        self.fake.fail.add("build")
+        env = make_env(self.fake, image=DEFAULT_IMAGE)
+        result = env.execute("ls")
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(self.sandbox_image(), SLIM_IMAGE)
+        self.assertEqual(env.base_image, SLIM_IMAGE)
+        self.assertIn("couldn't build the sandbox image", result["output"])
+
+    def test_custom_image_is_used_as_is(self):
+        self.fake.tools_image_present = False
+        make_env(self.fake, image="node:22-slim").execute("ls")
+        self.assertEqual(self.sandbox_image(), "node:22-slim")
+        self.assertNotIn("build", self.fake.verbs())
 
 
 if __name__ == "__main__":

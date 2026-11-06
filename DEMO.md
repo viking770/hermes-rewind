@@ -1,5 +1,7 @@
 # 90-second demo script (Rewind)
 
+**Before recording.** Run one terminal command through Rewind once (any command), so the one-time image builds (about a minute) happen off camera. The sandbox then has `git` and `curl` from the first command.
+
 **0–10s.** Title card: "Rewind: an undo button for your AI agent's terminal." Show `hermes config set terminal.backend rewind`.
 
 **10–30s.** In a Hermes session: "Clone a small repo into /workspace and get its tests passing." The agent works, and the status/tool calls show snapshots being taken (`rewind_list` shows s1…s4).

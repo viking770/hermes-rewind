@@ -35,8 +35,19 @@ from .store import Store
 # Pinned by digest: a tag on Docker Hub can be re-pointed, a digest can't. This is the
 # multi-platform index (amd64, arm64, ...) of python:3.12-slim built 2026-10-28.
 # To update: `docker pull python:3.12-slim` then
-# `docker image inspect python:3.12-slim -f "{{index .RepoDigests 0}}"`. REWIND_IMAGE overrides it.
-DEFAULT_IMAGE = "python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159"
+# `docker image inspect python:3.12-slim -f "{{index .RepoDigests 0}}"`.
+SLIM_IMAGE = "python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159"
+# The default sandbox image: the pinned slim image plus git and curl, built
+# locally once per machine, so "clone a repo" works in a fresh sandbox without
+# an apt-get first. Bump the tag when the Dockerfile changes. If it can't be
+# built (offline, say), the sandbox starts from SLIM_IMAGE. REWIND_IMAGE overrides both.
+TOOLS_IMAGE = "hermes-rewind-base:1"
+_TOOLS_DOCKERFILE = (
+    f"FROM {SLIM_IMAGE}\n"
+    "RUN apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates "
+    "&& rm -rf /var/lib/apt/lists/*\n"
+)
+DEFAULT_IMAGE = TOOLS_IMAGE
 DEFAULT_CWD = "/workspace"
 DEFAULT_MAX_SNAPSHOTS = 25
 DEFAULT_COMPACT_MB = 256
@@ -79,7 +90,7 @@ _BLOCKED_V6 = ("::1/128", "::ffff:0:0/96", "64:ff9b::/96", "64:ff9b:1::/48", "20
 GUARD_IMAGE = "hermes-rewind-netguard:2"  # bump when the Dockerfile or its base changes
 _GUARD_OK = "REWIND_GUARD_OK"
 _GUARD_DOCKERFILE = (
-    f"FROM {DEFAULT_IMAGE}\n"
+    f"FROM {SLIM_IMAGE}\n"
     "RUN apt-get update && apt-get install -y --no-install-recommends iptables "
     "&& rm -rf /var/lib/apt/lists/*\n"
 )
@@ -350,6 +361,8 @@ class RewindEnvironment:
     def _start_container(self, image: str) -> None:
         if not image or image.startswith("-"):  # never let an image name become a docker option
             raise RewindError(f"Refusing to start the sandbox from image {image!r}.")
+        if image == TOOLS_IMAGE:
+            image = self._ensure_tools_image()
         mode = self.network_mode
         try:
             self._run_container(image, "none" if mode == "none" else "bridge")
@@ -427,6 +440,29 @@ class RewindEnvironment:
         )
         if code != 0 or _GUARD_OK not in out:
             raise RewindError(f"network rules failed (exit {code}): {out.strip()[-300:]}")
+
+    def _ensure_tools_image(self) -> str:
+        """Build the default image (slim + git + curl) if this machine doesn't
+        have it yet, and return the image to start from: it, or the plain slim
+        image when it can't be built."""
+        if self._inspect_image_exists(TOOLS_IMAGE):
+            return TOOLS_IMAGE
+        started = time.time()
+        try:
+            with tempfile.TemporaryDirectory(prefix="rewind-base-") as build_dir:
+                Path(build_dir, "Dockerfile").write_text(_TOOLS_DOCKERFILE, encoding="utf-8")
+                self._docker("build", "--quiet", "-t", TOOLS_IMAGE, build_dir, timeout=900)
+        except (RewindError, subprocess.TimeoutExpired, OSError) as exc:
+            audit.log("base_image_build_failed", task_id=self.task_id, error=str(exc)[:200], fallback=SLIM_IMAGE)
+            self._note += (f"[rewind] warning: couldn't build the sandbox image with git and curl "
+                           f"({str(exc)[:200]}), so this sandbox starts without them.\n")
+            if self.base_image == TOOLS_IMAGE:
+                self.base_image = SLIM_IMAGE
+            return SLIM_IMAGE
+        audit.log("base_image_built", task_id=self.task_id, image=TOOLS_IMAGE, seconds=int(time.time() - started))
+        self._note += (f"[rewind] First run on this machine: built the sandbox image {TOOLS_IMAGE} "
+                       f"(Python, git, curl) in {int(time.time() - started)}s. Later sandboxes start at once.\n")
+        return TOOLS_IMAGE
 
     def _ensure_guard_image(self) -> None:
         if self._inspect_image_exists(GUARD_IMAGE):

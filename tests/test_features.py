@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 
 from rewind import policy, registry, store as store_mod, tools, version
-from rewind.environment import _LIST_FILES, RewindEnvironment, RewindError
+from rewind.environment import _LIST_FILES, SLIM_IMAGE, RewindEnvironment, RewindError
 from rewind.store import Store
 
 from .test_environment import FakeDocker
@@ -41,7 +41,7 @@ class FilesDocker(FakeDocker):
     def __call__(self, argv, timeout=None):
         verb = argv[1]
         if verb == "run" and "--rm" not in argv:
-            self.started_from = next(a for a in argv if a.startswith(("python:", "hermes-rewind/")))
+            self.started_from = next(a for a in argv if a.startswith(("python:", "hermes-rewind/", "hermes-rewind-base:")))
             self.live = None
         if verb == "exec" and argv[-1] == _LIST_FILES:
             self.calls.append(list(argv))
@@ -74,6 +74,7 @@ def make_env(fake, **kw):
     kw.setdefault("background", False)
     kw.setdefault("network", "none")
     kw.setdefault("task_id", "session:demo")
+    kw.setdefault("image", SLIM_IMAGE)  # the default image's build step has tests of its own
     return RewindEnvironment(runner=fake, **kw)
 
 
