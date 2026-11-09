@@ -16,6 +16,7 @@ and a dead owner are deleted outright.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -76,6 +77,42 @@ class Store:
             f.write(json.dumps(record, indent=1))
         os.replace(tmp, path)
         _owner_only(path, 0o600)
+
+    @contextlib.contextmanager
+    def claim(self, task_id: str, wait: float = 2.0, stale: float = 60.0) -> Iterator[bool]:
+        """An exclusive, cross-process lock on one task's record, for taking it over.
+        Yields True when held, False when another process holds it (after ``wait``
+        seconds); the caller then leaves the record alone. A lock older than
+        ``stale`` seconds is from a process that died holding it and is broken."""
+        self.dir.mkdir(parents=True, exist_ok=True)
+        lock = self.path(task_id).with_suffix(".lock")
+        deadline = time.monotonic() + wait
+        held = False
+        while True:
+            try:
+                fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+                held = True
+                break
+            except FileExistsError:
+                try:
+                    if time.time() - lock.stat().st_mtime > stale:
+                        lock.unlink()
+                        continue
+                except OSError:
+                    continue  # it went away meanwhile: try again
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+        try:
+            yield held
+        finally:
+            if held:
+                try:
+                    lock.unlink()
+                except OSError:
+                    pass
 
     def delete(self, task_id: str) -> None:
         try:

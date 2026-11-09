@@ -45,7 +45,7 @@ Requires Docker (Docker Desktop on macOS/Windows, Docker Engine on Linux).
 
 (`/undo`, `/rollback` and `/snapshot` are Hermes's own commands for conversation turns and checkpoints. They don't touch the Rewind sandbox.)
 
-On the command line, `hermes rewind status` shows the same status, `hermes rewind gc` deletes expired snapshots and leftovers now, `hermes rewind purge` deletes every kept snapshot right away (`--exports` also deletes Rewind's export folders, and only those: other files in `REWIND_EXPORT_DIR` are left alone), and `hermes rewind log` shows what Rewind did recently (see [Audit log](#audit-log)).
+On the command line, `hermes rewind status` shows the same status, `hermes rewind gc` deletes expired snapshots and leftovers now, `hermes rewind purge` deletes every kept snapshot right away (`--exports` also deletes Rewind's export folders, and only those: other files and folders in `REWIND_EXPORT_DIR` are left alone, and an export never takes over a folder that already existed), and `hermes rewind log` shows what Rewind did recently (see [Audit log](#audit-log)).
 
 ## Agent tools
 

@@ -7,9 +7,10 @@ one means the change cannot be undone.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import shlex
-from typing import Optional
+from typing import List, Optional
 from urllib.parse import urlsplit
 
 MODES = ("mutating", "always", "off")
@@ -104,9 +105,8 @@ def may_run_hooks(command: str) -> bool:
             words = shlex.split(segment)
         except ValueError:
             words = segment.split()
-        while words and (_ASSIGNMENT.match(words[0]) or words[0] in _WRAPPERS):
-            words = words[1:]
-        if words and words[0].rsplit("/", 1)[-1] in HOOKABLE_PROGRAMS:
+        words, hidden = _strip_prefixes(words, 0)  # NAME=x, time, env -u X, sudo ...
+        if hidden is not None or (words and words[0].rsplit("/", 1)[-1] in HOOKABLE_PROGRAMS):
             return True
     return False
 
@@ -307,8 +307,11 @@ def _split_commands(command: str) -> list:
 _SCRIPT_SENDS = re.compile(
     r"\b(?:requests|httpx|session|client)\.(?:post|put|patch|delete)\(|"
     r"\burllib\.request\.(?:urlopen|Request)\([^)]*data\s*=|"
-    # urlopen(url, b"...") / Request(url, data): data passed positionally.
-    r"\b(?:urlopen|Request)\(\s*[^,()]+(?:\([^()]*\))?\s*,\s*(?!timeout\b|context\b|headers\b)[^\s)]|"
+    # urlopen(url, b"...") / Request(url, data): data passed positionally. The first
+    # argument is one bounded run (with at most one call inside) and no separate
+    # whitespace runs around it: overlapping ones made this a ReDoS.
+    r"\b(?:urlopen|Request)\([^,()\n]{1,300}(?:\([^()\n]{0,300}\)[^,()\n]{0,300})?,[ \t]*"
+    r"(?!timeout\b|context\b|headers\b|method\b|unverifiable\b|origin_req_host\b|cafile\b)[^\s)]|"
     r"\.request\(\s*['\"](?:POST|PUT|PATCH|DELETE)['\"]|"  # http.client / urllib3
     r"\bfetch\([^)]*method\s*:\s*['\"](?:POST|PUT|PATCH|DELETE)|"
     r"\baxios\.(?:post|put|patch|delete)\(|"
@@ -467,8 +470,9 @@ def _words_irreversible(words: list, depth: int = 0) -> Optional[str]:
         if method in _HTTP_WRITE_METHODS:
             # The host is part of the quoted action, so approving "always" for one
             # host's POSTs doesn't approve every curl write everywhere.
-            return f"`{program} {method.lower()} {_http_host(args)}` sends an HTTP {method} request"
-    if program in _SOCKET_TOOLS and not any(a == "-z" or re.fullmatch(r"-[A-Za-z]*z[A-Za-z]*", a) for a in args):
+            return f"`{program} {method.lower()} {_http_host(args, program)}` sends an HTTP {method} request"
+    # -z only probes a port; -l listens (inbound, which the guard blocks anyway).
+    if program in _SOCKET_TOOLS and not _short_flags(args, "zl") and "--listen" not in args:
         return f"`{program}` sends raw network data outside the sandbox"
     if program in _REMOTE_COPY and any(":" in a and not a.startswith("-") for a in positional):
         return f"`{program}` copies files to or from another machine"
@@ -485,18 +489,60 @@ def _release_script(path: str) -> Optional[str]:
     return None
 
 
-def _http_host(args: list) -> str:
-    """The host an HTTP command targets, for approval keys ("unknown" if unclear)."""
+# Options whose next argument is a value, not a URL (so `-o resp.json` isn't a host).
+_HTTP_VALUE_LONG = frozenset({
+    "--output", "--header", "--data", "--data-raw", "--data-binary", "--data-urlencode", "--data-ascii",
+    "--form", "--form-string", "--json", "--upload-file", "--user", "--user-agent", "--referer", "--cookie",
+    "--cookie-jar", "--proxy", "--request", "--write-out", "--config", "--cacert", "--capath", "--cert",
+    "--key", "--max-time", "--connect-timeout", "--range", "--continue-at", "--retry", "--resolve",
+    "--connect-to", "--output-dir", "--method", "--post-data", "--post-file", "--body-data", "--body-file",
+    "--output-document", "--append-output", "--execute", "--save-cookies", "--load-cookies", "--auth",
+})
+_HTTP_VALUE_SHORT = {"curl": set("HoeuAbcxmwKErYyzCUQdFTX"), "wget": set("OoaeUPTtwQiB"),
+                     "http": set("aAo"), "https": set("aAo"), "xh": set("aAo")}
+_BARE_HOST = re.compile(r"(?:localhost|\[[0-9A-Fa-f:.]+\]|[0-9]{1,3}(?:\.[0-9]{1,3}){3}|"
+                        r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})(?::[0-9]+)?(?:[/?#]|$)")
+
+
+def _http_host(args: list, program: str = "curl") -> str:
+    """The host(s) an HTTP command targets, for approval keys. Several hosts are
+    all named ("a.example+b.example"). With none recognisable (a URL in a
+    variable, say) the key is unique to this exact command, so approving it
+    "always" doesn't approve other unknown targets."""
+    hosts: List[str] = []
+    short_values = _HTTP_VALUE_SHORT.get(program, set())
+    skip = False
     for arg in args:
-        if arg.startswith("-"):
+        if skip:
+            skip = False
             continue
-        candidate = arg if "://" in arg else ("http://" + arg if re.match(r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?:[:/]|$)", arg)
-                                              else "")
-        if candidate:
-            host = urlsplit(candidate).hostname or ""
-            if re.fullmatch(r"[a-z0-9.-]+", host):
-                return host
-    return "unknown"
+        if arg.startswith("--"):
+            name, eq, value = arg.partition("=")
+            if name == "--url":
+                if not eq:
+                    continue  # the next argument is the URL and is read as one
+                arg = value
+            else:
+                skip = name in _HTTP_VALUE_LONG and not eq
+                continue
+        elif arg.startswith("-") and len(arg) > 1:
+            for pos, letter in enumerate(arg[1:], 1):
+                if letter in short_values:
+                    skip = pos == len(arg) - 1  # value is the next argument, else attached
+                    break
+            continue
+        candidate = arg if "://" in arg else ("http://" + arg if _BARE_HOST.match(arg) else "")
+        if not candidate:
+            continue
+        try:
+            host = (urlsplit(candidate).hostname or "").lower()
+        except ValueError:
+            continue
+        if re.fullmatch(r"[a-z0-9.:-]+", host) and host not in hosts:
+            hosts.append(host)
+    if hosts:
+        return "+".join(sorted(hosts))
+    return "unknown-" + hashlib.sha1("\0".join(args).encode("utf-8", "replace")).hexdigest()[:8]
 
 
 def _http_method(program: str, args: list) -> Optional[str]:

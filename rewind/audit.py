@@ -113,10 +113,11 @@ def tail(count: int = 50) -> Iterator[dict]:
     yield from entries[-count:]
 
 
-# C0/C1 controls, plus characters that hide or reorder text on screen: zero-width
-# characters, bidi marks, overrides and isolates (U+202E can make "evil.exe" read
-# as "exe.live"), line and paragraph separators, and the BOM.
-_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f​-‏ -‮⁠-⁩﻿]")
+# C0/C1 controls, plus characters that hide or reorder text on screen: the soft
+# hyphen, zero-width characters, Arabic/Mongolian/bidi marks, overrides and
+# isolates (U+202E can make "evil.exe" read as "exe.live"), line and paragraph
+# separators, and the BOM. Written as escapes so the source holds no invisible text.
+_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]")
 
 
 def _printable(text: str) -> str:

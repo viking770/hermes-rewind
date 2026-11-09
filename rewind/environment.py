@@ -94,6 +94,7 @@ _BLOCKED_V6 = ("::1/128", "::ffff:0:0/96", "64:ff9b::/96", "64:ff9b:1::/48", "20
                "fc00::/7", "fe80::/10", "ff00::/8")
 GUARD_IMAGE = "hermes-rewind-netguard:2"  # bump when the Dockerfile or its base changes
 _GUARD_OK = "REWIND_GUARD_OK"
+_INBOUND_OPEN = "REWIND_INBOUND_OPEN"  # the guard couldn't filter inbound (no conntrack)
 _GUARD_DOCKERFILE = (
     f"FROM {SLIM_IMAGE}\n"
     "RUN apt-get update && apt-get install -y --no-install-recommends iptables "
@@ -182,11 +183,16 @@ def _guard_script(nameservers: Sequence[str], host_ips: Sequence[str] = ()) -> s
     v4 = [ns for ns in nameservers if ":" not in ns]
     v6 = [ns for ns in nameservers if ":" in ns]
     # Inbound: only replies to the sandbox's own connections (and loopback), so
-    # other containers on the Docker network can't reach services it runs.
+    # other containers on the Docker network can't reach services it runs. That
+    # needs the kernel's conntrack match; without it inbound stays open (and the
+    # caller says so) rather than the sandbox losing its network altogether.
     lines = ["set -e",
              "iptables -A INPUT -i lo -j ACCEPT",
-             "iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
-             "iptables -A INPUT -j DROP",
+             "if iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; then",
+             "  iptables -A INPUT -j DROP",
+             "else",
+             f"  echo {_INBOUND_OPEN}",
+             "fi",
              "iptables -A OUTPUT -o lo -j ACCEPT"]
     # A resolver is reachable for DNS only, wherever it is: on cloud VMs it can be a
     # platform address that serves more than DNS (Azure's 168.63.129.16 serves the
@@ -196,10 +202,19 @@ def _guard_script(nameservers: Sequence[str], host_ips: Sequence[str] = ()) -> s
         lines.append(f"iptables -A OUTPUT -d {ns} -j REJECT")
     lines += [f"iptables -A OUTPUT -d {net} -j REJECT" for net in _BLOCKED_V4]
     lines += [f"iptables -A OUTPUT -d {ip}/32 -j REJECT" for ip in host_ips if ":" not in ip]
+    # ICMPv6 neighbour/router discovery must pass, or IPv6 can't find the gateway
+    # at all (it goes to link-local and multicast addresses, blocked below). These
+    # message types carry no connection data to other hosts.
     v6_rules = ["ip6tables -A INPUT -i lo -j ACCEPT",
-                "ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
-                "ip6tables -A INPUT -j DROP",
-                "ip6tables -A OUTPUT -o lo -j ACCEPT"]
+                "ip6tables -A INPUT -p ipv6-icmp -j ACCEPT",
+                "if ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; then",
+                "  ip6tables -A INPUT -j DROP",
+                "else",
+                f"  echo {_INBOUND_OPEN}",
+                "fi",
+                "ip6tables -A OUTPUT -o lo -j ACCEPT",
+                *(f"ip6tables -A OUTPUT -p ipv6-icmp --icmpv6-type {t} -j ACCEPT"
+                  for t in ("router-solicitation", "neighbour-solicitation", "neighbour-advertisement"))]
     for ns in v6:
         v6_rules += [f"ip6tables -A OUTPUT -d {ns} -p {p} --dport 53 -j ACCEPT" for p in ("udp", "tcp")]
         v6_rules.append(f"ip6tables -A OUTPUT -d {ns} -j REJECT")
@@ -578,6 +593,11 @@ class RewindEnvironment:
         )
         if code != 0 or _GUARD_OK not in out:
             raise RewindError(f"network rules failed (exit {code}): {out.strip()[-300:]}")
+        if _INBOUND_OPEN in out:
+            audit.log("inbound_unfiltered", task_id=self.task_id, reason="no conntrack match")
+            self._note += ("[rewind] note: this Docker host can't filter connections *into* the sandbox "
+                           "(no conntrack), so other containers may reach servers it runs. Outbound "
+                           "filtering is in place.\n")
 
     def _ensure_tools_image(self) -> str:
         """Build the default image (slim + git + curl) if this machine doesn't
@@ -640,10 +660,28 @@ class RewindEnvironment:
             pass
 
     def _adopt(self) -> None:
-        """Pick up the snapshots a previous sandbox for this task parked."""
+        """Pick up the snapshots a previous sandbox for this task parked.
+
+        Taking a record over is atomic across processes: under the store's lock
+        the record is re-read and, once adopted, immediately rewritten as live
+        and owned by this process. A second process resuming the same task
+        (Hermes's CLI and gateway share the `default` session, say) then sees a
+        live owner and starts a fresh sandbox, instead of reusing the same
+        container and network-holder names and removing the first one's."""
+        if not self._store.load(self.task_id):
+            return
+        with self._store.claim(self.task_id) as held:
+            if not held:
+                audit.log("record_busy", task_id=self.task_id, reason="another process is resuming it")
+                return
+            if self._adopt_record():
+                self._store.save(self._record("live"))
+
+    def _adopt_record(self) -> bool:
+        """Adopt the task's record if it may be resumed. True when adopted."""
         record = self._store.load(self.task_id)
         if not record or store_mod.is_expired(record):
-            return
+            return False
         # A record may resume from its own snapshots, or from a base image this
         # sandbox would use anyway, never from an image it names itself: an edited
         # record must not be able to start the sandbox from an arbitrary image.
@@ -651,13 +689,13 @@ class RewindEnvironment:
         if record.get("base_image") not in allowed_bases:
             audit.log("record_ignored", task_id=self.task_id, reason="base image not allowed",
                       base_image=str(record.get("base_image"))[:120])
-            return
+            return False
         own = f"{record['repository']}:"
         if record.get("image") and not (str(record["image"]).startswith(own) or record["image"] in allowed_bases):
-            return
+            return False
         if record.get("status") == "live":
             if record.get("host") != store_mod.hostname() or store_mod.pid_alive(record.get("owner_pid")):
-                return  # another live process owns it
+                return False  # another live process owns it
             old = record.get("container")
             if old:  # its owner died: keep the state it was in
                 code, _ = self._docker("commit", "--message", "rewind recovered", old,
@@ -668,7 +706,7 @@ class RewindEnvironment:
                 self._docker("rm", "-f", f"{old}-net", timeout=60, check=False)
         image = record.get("image") or ""
         if not image or self._inspect_image(image) == (0, 0):
-            return  # the images are gone (pruned by hand?): start fresh
+            return False  # the images are gone (pruned by hand?): start fresh
         self.repository = record["repository"]
         # The container is named after the repository (store.is_valid_record checks
         # this), so the live record written after a resume stays loadable after a crash.
@@ -688,6 +726,7 @@ class RewindEnvironment:
             f"[rewind] Resumed this session's sandbox from {_ago(age)} ago with "
             f"{len(self.snapshots)} snapshot(s); earlier changes can still be undone.\n"
         )
+        return True
 
     # ----------------------------------------------------------- environment
     def execute(
@@ -834,9 +873,10 @@ class RewindEnvironment:
             self._drop_pending()  # the parked state is the state now (see restore)
             state = self._commit().image
             self._docker("rm", "-f", self.container, timeout=60)
-            self._remove_netns()
             self._started = False
             self._image = state
+        # Always: a start that failed after the holder came up leaves it running.
+        self._remove_netns()
         keep = {s.image for s in self.snapshots} | {self._image, self.base_image}
         if previous not in keep:  # an earlier parked state, now superseded
             self._dropped_images.append(previous)
@@ -1183,9 +1223,7 @@ class RewindEnvironment:
                 f"(REWIND_EXPORT_TOTAL_MB) in {dest_root}. Delete old exports there first."
             )
         slug = _SLUG.sub("-", self.task_id.lower()).strip("-")[-40:] or "task"
-        session_dir = Path(dest_root) / slug
-        session_dir.mkdir(parents=True, exist_ok=True)
-        _mark_export_folder(session_dir)
+        session_dir = _session_export_dir(Path(dest_root), slug)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         dest, n = session_dir / stamp, 1
         while True:
@@ -1263,13 +1301,27 @@ def _merge_diff(changes: Dict[str, str], diff: str) -> None:
 EXPORT_MARKER = ".hermes-rewind-export"
 
 
-def _mark_export_folder(folder: Path) -> None:
-    """Tag a per-session export folder as Rewind's, so purge and the size cap
-    touch only what Rewind created."""
-    marker = folder / EXPORT_MARKER
-    if not marker.exists():
-        marker.write_text("Created by Hermes Rewind exports. `hermes rewind purge --exports` deletes "
-                          "this folder.\n", encoding="utf-8")
+def _session_export_dir(root: Path, slug: str) -> Path:
+    """The per-session export folder: ``<root>/<slug>`` if Rewind made it (it holds
+    the marker) or makes it now, else ``<slug>-rewind``, ``<slug>-rewind-2``... A
+    folder that already existed without the marker is the user's own (a
+    `default` folder in Downloads, say) and is never marked, so purge and the size
+    cap never touch it."""
+    root.mkdir(parents=True, exist_ok=True)
+    for n in range(1, 100):
+        name = slug if n == 1 else (f"{slug}-rewind" if n == 2 else f"{slug}-rewind-{n - 1}")
+        folder = root / name
+        try:
+            folder.mkdir()
+        except FileExistsError:
+            if not folder.is_symlink() and folder.is_dir() and (folder / EXPORT_MARKER).is_file():
+                return folder  # Rewind's own, from an earlier export
+            continue
+        (folder / EXPORT_MARKER).write_text(
+            "Created by Hermes Rewind exports. `hermes rewind purge --exports` deletes this folder.\n",
+            encoding="utf-8")
+        return folder
+    raise RewindError(f"Couldn't find a free folder name for exports under {root}.")
 
 
 def export_folders(root: Path, legacy: bool = False) -> List[Path]:
