@@ -7,7 +7,7 @@ Enable with:
 Optional settings (environment variables):
     REWIND_IMAGE          base image (default hermes-rewind-base:1: pinned python:3.12-slim + git, curl)
     REWIND_SNAPSHOT_MODE  mutating | always | off (default mutating)
-    REWIND_MAX_SNAPSHOTS  automatic snapshots to keep (default 25)
+    REWIND_MAX_SNAPSHOTS  snapshots to keep of each kind (default 25)
     REWIND_NETWORK        internet (default; this computer and the LAN are blocked), none, or full
     REWIND_CPUS / REWIND_MEMORY_MB / REWIND_PIDS_LIMIT  sandbox limits (default: Hermes's
                           terminal.container_cpu and container_memory, 2048 processes; 0 = no limit)

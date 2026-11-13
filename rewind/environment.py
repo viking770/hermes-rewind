@@ -94,6 +94,7 @@ _BLOCKED_V6 = ("::1/128", "::ffff:0:0/96", "64:ff9b::/96", "64:ff9b:1::/48", "20
                "fc00::/7", "fe80::/10", "ff00::/8")
 GUARD_IMAGE = "hermes-rewind-netguard:2"  # bump when the Dockerfile or its base changes
 _GUARD_OK = "REWIND_GUARD_OK"
+_INBOUND_OPEN = "REWIND_INBOUND_OPEN"  # the guard couldn't filter inbound (no conntrack)
 _GUARD_DOCKERFILE = (
     f"FROM {SLIM_IMAGE}\n"
     "RUN apt-get update && apt-get install -y --no-install-recommends iptables "
@@ -121,6 +122,7 @@ _HOST_CACHE_SECONDS = 300.0
 _HOSTNAME_LOOKUP_SECONDS = 1.0
 _host_cache: Tuple[float, List[str]] = (0.0, [])
 _host_cache_lock = threading.Lock()
+_EXPORT_LOCK = threading.Lock()  # one export at a time per process (shared size cap)
 
 
 def _hostname_addresses(timeout: float) -> List[str]:
@@ -180,7 +182,18 @@ def _guard_script(nameservers: Sequence[str], host_ips: Sequence[str] = ()) -> s
     host_ips = _clean_addresses(host_ips)
     v4 = [ns for ns in nameservers if ":" not in ns]
     v6 = [ns for ns in nameservers if ":" in ns]
-    lines = ["set -e", "iptables -A OUTPUT -o lo -j ACCEPT"]
+    # Inbound: only replies to the sandbox's own connections (and loopback), so
+    # other containers on the Docker network can't reach services it runs. That
+    # needs the kernel's conntrack match; without it inbound stays open (and the
+    # caller says so) rather than the sandbox losing its network altogether.
+    lines = ["set -e",
+             "iptables -A INPUT -i lo -j ACCEPT",
+             "if iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; then",
+             "  iptables -A INPUT -j DROP",
+             "else",
+             f"  echo {_INBOUND_OPEN}",
+             "fi",
+             "iptables -A OUTPUT -o lo -j ACCEPT"]
     # A resolver is reachable for DNS only, wherever it is: on cloud VMs it can be a
     # platform address that serves more than DNS (Azure's 168.63.129.16 serves the
     # VM's configuration on port 80), and it may sit outside every blocked range.
@@ -189,7 +202,19 @@ def _guard_script(nameservers: Sequence[str], host_ips: Sequence[str] = ()) -> s
         lines.append(f"iptables -A OUTPUT -d {ns} -j REJECT")
     lines += [f"iptables -A OUTPUT -d {net} -j REJECT" for net in _BLOCKED_V4]
     lines += [f"iptables -A OUTPUT -d {ip}/32 -j REJECT" for ip in host_ips if ":" not in ip]
-    v6_rules = ["ip6tables -A OUTPUT -o lo -j ACCEPT"]
+    # ICMPv6 neighbour/router discovery must pass, or IPv6 can't find the gateway
+    # at all (it goes to link-local and multicast addresses, blocked below). These
+    # message types carry no connection data to other hosts.
+    v6_rules = ["ip6tables -A INPUT -i lo -j ACCEPT",
+                "ip6tables -A INPUT -p ipv6-icmp -j ACCEPT",
+                "if ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; then",
+                "  ip6tables -A INPUT -j DROP",
+                "else",
+                f"  echo {_INBOUND_OPEN}",
+                "fi",
+                "ip6tables -A OUTPUT -o lo -j ACCEPT",
+                *(f"ip6tables -A OUTPUT -p ipv6-icmp --icmpv6-type {t} -j ACCEPT"
+                  for t in ("router-solicitation", "neighbour-solicitation", "neighbour-advertisement"))]
     for ns in v6:
         v6_rules += [f"ip6tables -A OUTPUT -d {ns} -p {p} --dport 53 -j ACCEPT" for p in ("udp", "tcp")]
         v6_rules.append(f"ip6tables -A OUTPUT -d {ns} -j REJECT")
@@ -273,7 +298,10 @@ class Snapshot:
 
     def describe(self) -> dict:
         info = asdict(self)
-        info["age_seconds"] = round(time.time() - self.created_at, 1)
+        try:
+            info["age_seconds"] = round(time.time() - float(self.created_at), 1)
+        except (TypeError, ValueError):  # a hand-edited record
+            info["age_seconds"] = None
         info["state"] = self.state()
         return info
 
@@ -399,9 +427,21 @@ class RewindEnvironment:
         if store is not None:
             try:
                 self._adopt()
-            except (OSError, ValueError, KeyError, TypeError):
-                pass  # a damaged record must never stop the sandbox from starting
+            except (OSError, ValueError, KeyError, TypeError, AttributeError, RewindError,
+                    subprocess.TimeoutExpired) as exc:
+                # A damaged record or a slow daemon (the crash-recovery commit can
+                # time out) must never stop the sandbox from starting.
+                audit.log("resume_failed", task_id=task_id, error=f"{type(exc).__name__}: {str(exc)[:200]}")
+                self._reset_identity(slug)
         registry.add(task_id, self)
+
+    def _reset_identity(self, slug: str) -> None:
+        """Start as a brand-new sandbox, undoing anything a failed resume half-set."""
+        suffix = uuid.uuid4().hex[:6]
+        self.container = f"hermes-rewind-{slug}-{suffix}"
+        self.repository = f"hermes-rewind/{slug}-{suffix}"
+        self.snapshots, self._dropped_images, self._carried_changes = [], [], {}
+        self._seq, self._image, self._cwd_from_restore = 0, self.base_image, False
 
     # ------------------------------------------------------------------ docker
     def _docker(self, *args: str, timeout: float = 120.0, check: bool = True) -> Tuple[int, str]:
@@ -416,8 +456,14 @@ class RewindEnvironment:
         if image == TOOLS_IMAGE:
             image = self._ensure_tools_image()
         mode = self.network_mode
+        network = "none" if mode == "none" else "bridge"
+        if mode == "internet":
+            # The rules go in *before* the sandbox exists: a restored or resumed
+            # sandbox runs an image the agent built, whose entrypoint (/bin/sh) it
+            # may have replaced, so it must never run on an unfiltered network.
+            network = self._guarded_network()
         try:
-            self._run_container(image, "none" if mode == "none" else "bridge")
+            self._run_container(image, network)
         except RewindError as exc:
             if not self._limits or not _LIMIT_ERROR.search(str(exc)):
                 raise
@@ -427,23 +473,39 @@ class RewindEnvironment:
             self._note += ("[rewind] warning: this Docker can't apply CPU/memory/process limits, "
                            f"so the sandbox runs without them ({str(exc)[:200]}).\n")
             try:
-                self._run_container(image, "none" if mode == "none" else "bridge")
+                self._run_container(image, network)
             except RewindError as retry_exc:
                 raise RewindError(f"{retry_exc} (after: {str(exc)[:300]})") from exc
         self._image = image
-        if mode == "internet":
+
+    @property
+    def netns_container(self) -> str:
+        """The trusted container that holds the sandbox's firewalled network."""
+        return f"{self.container}-net"
+
+    def _remove_netns(self) -> None:
+        if self.network_mode == "internet":
+            self._docker("rm", "-f", self.netns_container, timeout=60, check=False)
+
+    def _guarded_network(self) -> str:
+        """Start the network holder, firewall it, and return the --network value
+        for the sandbox: ``container:<holder>``, or ``none`` if that failed."""
+        try:
+            self._guard_network()
+            return f"container:{self.netns_container}"
+        except (RewindError, subprocess.TimeoutExpired, OSError) as exc:
+            # Fail closed: a sandbox that can reach this computer is worse than one with no network.
             try:
-                self._guard_network()
-            except (RewindError, subprocess.TimeoutExpired, OSError) as exc:
-                # Fail closed: a sandbox that can reach this computer is worse than one with no network.
-                self._docker("rm", "-f", self.container, timeout=60, check=False)
-                self._run_container(image, "none")
-                audit.log("network_guard_failed", task_id=self.task_id, error=str(exc)[:200],
-                          fallback="no network")
-                self._note += (
-                    "[rewind] warning: couldn't firewall the sandbox's network, so it has no network "
-                    f"this time ({str(exc)[:200]}). Set REWIND_NETWORK=full to allow unrestricted access.\n"
-                )
+                self._remove_netns()
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            audit.log("network_guard_failed", task_id=self.task_id, error=str(exc)[:200],
+                      fallback="no network")
+            self._note += (
+                "[rewind] warning: couldn't firewall the sandbox's network, so it has no network "
+                f"this time ({str(exc)[:200]}). Set REWIND_NETWORK=full to allow unrestricted access.\n"
+            )
+            return "none"
 
     def _run_container(self, image: str, network: str) -> None:
         argv = [
@@ -457,8 +519,8 @@ class RewindEnvironment:
             "--label", f"{store_mod.HOST_LABEL}={store_mod.hostname()}",
             *_SECURITY_ARGS, *self._limits,
         ]
-        if network == "none":
-            argv += ["--network", "none"]
+        if network != "bridge":
+            argv += ["--network", network]
         # The starting directory is created only in a brand-new sandbox. A restored or
         # resumed one keeps its files as they were: a folder the agent deleted stays deleted.
         dirs = [DEFAULT_CWD] + ([self.cwd] if image == self.base_image and self.cwd != DEFAULT_CWD else [])
@@ -494,26 +556,48 @@ class RewindEnvironment:
         """Block the host, private networks and cloud metadata from inside the
         sandbox's network namespace, leaving DNS and the internet reachable.
 
-        A short-lived helper container joins the sandbox's namespace with
-        NET_ADMIN and installs the rules. The sandbox itself runs with every
-        capability dropped, so nothing inside it can change them back.
+        The namespace belongs to a holder container started from the trusted
+        guard image (never from an agent-built snapshot) and the sandbox joins
+        it only once the rules are in, so no sandbox code ever runs unfiltered.
+        DNS servers and routes are read with the holder's own binaries too, so
+        the sandbox can't steer which addresses are allowed. A short-lived
+        helper joins the namespace with NET_ADMIN and installs the rules; the
+        holder and the sandbox run with every capability dropped, so nothing
+        inside them can change the rules back.
         """
         self._ensure_guard_image()
-        _, resolv = self._docker("exec", self.container, "cat", "/etc/resolv.conf", timeout=30, check=False)
+        holder = self.netns_container
+        self._docker("rm", "-f", holder, timeout=60, check=False)  # never reuse a namespace: start clean
+        self._docker(
+            "run", "-d", "--name", holder,
+            "--label", "hermes.rewind=1",
+            "--label", f"hermes.rewind.task={self.task_id}",
+            "--label", f"{store_mod.PID_LABEL}={os.getpid()}",
+            "--label", f"{store_mod.HOST_LABEL}={store_mod.hostname()}",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+            "--entrypoint", "sh", GUARD_IMAGE, "-c", "while :; do sleep 3600; done",
+            timeout=120,
+        )
+        _, resolv = self._docker("exec", holder, "cat", "/etc/resolv.conf", timeout=30, check=False)
         servers = [line.split()[1] for line in resolv.splitlines()
                    if line.startswith("nameserver") and len(line.split()) > 1
                    and re.fullmatch(r"[0-9a-fA-F:.]+", line.split()[1])]
         # This computer as the sandbox sees it: its gateway (usually the host's
         # side of the Docker network), plus the host's own addresses.
-        _, routes = self._docker("exec", self.container, "cat", "/proc/net/route", timeout=30, check=False)
+        _, routes = self._docker("exec", holder, "cat", "/proc/net/route", timeout=30, check=False)
         host_ips = _default_gateways(routes) + self._host_addresses()
         code, out = self._docker(
-            "run", "--rm", "--network", f"container:{self.container}",
+            "run", "--rm", "--network", f"container:{holder}",
             "--cap-drop", "ALL", "--cap-add", "NET_ADMIN", "--entrypoint", "sh", GUARD_IMAGE,
             "-c", _guard_script(servers, host_ips), timeout=120, check=False,
         )
         if code != 0 or _GUARD_OK not in out:
             raise RewindError(f"network rules failed (exit {code}): {out.strip()[-300:]}")
+        if _INBOUND_OPEN in out:
+            audit.log("inbound_unfiltered", task_id=self.task_id, reason="no conntrack match")
+            self._note += ("[rewind] note: this Docker host can't filter connections *into* the sandbox "
+                           "(no conntrack), so other containers may reach servers it runs. Outbound "
+                           "filtering is in place.\n")
 
     def _ensure_tools_image(self) -> str:
         """Build the default image (slim + git + curl) if this machine doesn't
@@ -576,10 +660,28 @@ class RewindEnvironment:
             pass
 
     def _adopt(self) -> None:
-        """Pick up the snapshots a previous sandbox for this task parked."""
+        """Pick up the snapshots a previous sandbox for this task parked.
+
+        Taking a record over is atomic across processes: under the store's lock
+        the record is re-read and, once adopted, immediately rewritten as live
+        and owned by this process. A second process resuming the same task
+        (Hermes's CLI and gateway share the `default` session, say) then sees a
+        live owner and starts a fresh sandbox, instead of reusing the same
+        container and network-holder names and removing the first one's."""
+        if not self._store.load(self.task_id):
+            return
+        with self._store.claim(self.task_id) as held:
+            if not held:
+                audit.log("record_busy", task_id=self.task_id, reason="another process is resuming it")
+                return
+            if self._adopt_record():
+                self._store.save(self._record("live"))
+
+    def _adopt_record(self) -> bool:
+        """Adopt the task's record if it may be resumed. True when adopted."""
         record = self._store.load(self.task_id)
         if not record or store_mod.is_expired(record):
-            return
+            return False
         # A record may resume from its own snapshots, or from a base image this
         # sandbox would use anyway, never from an image it names itself: an edited
         # record must not be able to start the sandbox from an arbitrary image.
@@ -587,13 +689,13 @@ class RewindEnvironment:
         if record.get("base_image") not in allowed_bases:
             audit.log("record_ignored", task_id=self.task_id, reason="base image not allowed",
                       base_image=str(record.get("base_image"))[:120])
-            return
+            return False
         own = f"{record['repository']}:"
         if record.get("image") and not (str(record["image"]).startswith(own) or record["image"] in allowed_bases):
-            return
+            return False
         if record.get("status") == "live":
             if record.get("host") != store_mod.hostname() or store_mod.pid_alive(record.get("owner_pid")):
-                return  # another live process owns it
+                return False  # another live process owns it
             old = record.get("container")
             if old:  # its owner died: keep the state it was in
                 code, _ = self._docker("commit", "--message", "rewind recovered", old,
@@ -601,10 +703,14 @@ class RewindEnvironment:
                 if code == 0:
                     record["image"] = f"{record['repository']}:recovered"
                 self._docker("rm", "-f", old, timeout=60, check=False)
+                self._docker("rm", "-f", f"{old}-net", timeout=60, check=False)
         image = record.get("image") or ""
         if not image or self._inspect_image(image) == (0, 0):
-            return  # the images are gone (pruned by hand?): start fresh
+            return False  # the images are gone (pruned by hand?): start fresh
         self.repository = record["repository"]
+        # The container is named after the repository (store.is_valid_record checks
+        # this), so the live record written after a resume stays loadable after a crash.
+        self.container = "hermes-rewind-" + self.repository.split("/", 1)[1]
         self._seq = int(record.get("seq", 0))
         self.snapshots = [Snapshot.from_dict(s) for s in record.get("snapshots", [])]
         self._dropped_images = list(record.get("dropped_images", []))
@@ -620,9 +726,22 @@ class RewindEnvironment:
             f"[rewind] Resumed this session's sandbox from {_ago(age)} ago with "
             f"{len(self.snapshots)} snapshot(s); earlier changes can still be undone.\n"
         )
+        return True
 
     # ----------------------------------------------------------- environment
     def execute(
+        self, command: str, cwd: str = "", *, timeout: Optional[int] = None,
+        stdin_data: Optional[str] = None, **kwargs,
+    ) -> dict:
+        try:
+            return self._execute(command, cwd, timeout=timeout, stdin_data=stdin_data, **kwargs)
+        except (subprocess.TimeoutExpired, OSError, RewindError, ValueError, KeyError, TypeError,
+                AttributeError) as exc:
+            # Hermes's terminal tool expects a result, never an exception.
+            audit.log("execute_failed", task_id=self.task_id, error=f"{type(exc).__name__}: {str(exc)[:200]}")
+            return _result(f"[rewind] the command could not be run: {type(exc).__name__}: {exc}", 1)
+
+    def _execute(
         self, command: str, cwd: str = "", *, timeout: Optional[int] = None,
         stdin_data: Optional[str] = None, **kwargs,
     ) -> dict:
@@ -697,6 +816,11 @@ class RewindEnvironment:
             # what to do. A read-only command leaves the pending snapshot valid.
             # Never while a timed-out command may still be changing files: that
             # snapshot would hold a half-finished state labelled as a clean one.
+            # A pending snapshot from before a command that repository config could
+            # hook (`git status` running core.fsmonitor, say) may miss that command's
+            # writes, and would later be labelled as the state before the next change.
+            if self._pending is not None and policy.may_run_hooks(command):
+                self._drop_pending()
             if self._pending is None and stopped:
                 self._start_background()
             return _result(note + _cap_output(output, self.max_output_chars) + after, code, new_cwd)
@@ -751,6 +875,8 @@ class RewindEnvironment:
             self._docker("rm", "-f", self.container, timeout=60)
             self._started = False
             self._image = state
+        # Always: a start that failed after the holder came up leaves it running.
+        self._remove_netns()
         keep = {s.image for s in self.snapshots} | {self._image, self.base_image}
         if previous not in keep:  # an earlier parked state, now superseded
             self._dropped_images.append(previous)
@@ -770,6 +896,7 @@ class RewindEnvironment:
         if self._started:
             self._docker("rm", "-f", self.container, timeout=60, check=False)
             self._started = False
+        self._remove_netns()  # also when a start failed after the holder was up
         images = [s.image for s in self.snapshots] + self._dropped_images
         if self._pending is not None:
             images.append(self._pending.image)
@@ -926,9 +1053,11 @@ class RewindEnvironment:
         """Drop the oldest automatic snapshots beyond max_snapshots, and the oldest
         restore points (the undo points restores save) beyond the same number, so
         repeated undos can't pile up images. The newest restore points stay, so the
-        latest restores can still be undone. Manual checkpoints are kept."""
+        latest restores can still be undone. Manual checkpoints are capped the
+        same way, so an agent looping rewind_snapshot can't grow them without end."""
         for kind in ([s for s in self.snapshots if s.auto and not s.restore_point],
-                     [s for s in self.snapshots if s.restore_point]):
+                     [s for s in self.snapshots if s.restore_point],
+                     [s for s in self.snapshots if not s.auto and not s.restore_point]):
             excess = len(kind) - self.max_snapshots
             for snap in kind[:max(0, excess)]:
                 self.snapshots.remove(snap)
@@ -1048,7 +1177,8 @@ class RewindEnvironment:
 
     def _list_files_in_image(self, image: str) -> Optional[Dict[str, str]]:
         try:
-            code, out = self._docker("run", "--rm", "--network", "none", "--entrypoint", "sh", image,
+            code, out = self._docker("run", "--rm", "--network", "none", *_SECURITY_ARGS,
+                                     "--entrypoint", "sh", image,
                                      "-c", _LIST_FILES, timeout=120, check=False)
         except (subprocess.TimeoutExpired, OSError):
             return None
@@ -1077,36 +1207,48 @@ class RewindEnvironment:
                     f"{src} is {size_kb // 1024} MB, over the {self.export_max_mb} MB export limit "
                     "(REWIND_EXPORT_MAX_MB)."
                 )
-            # A cap on everything exported, so repeated exports can't fill the disk.
-            used_kb = _tree_bytes(Path(dest_root)) // 1024
-            if self.export_total_mb and used_kb + size_kb > self.export_total_mb * 1024:
-                raise RewindError(
-                    f"Exports already use {used_kb // 1024} MB of the {self.export_total_mb} MB allowed "
-                    f"(REWIND_EXPORT_TOTAL_MB) in {dest_root}. Delete old exports there first."
-                )
-            slug = _SLUG.sub("-", self.task_id.lower()).strip("-")[-40:] or "task"
-            dest = Path(dest_root) / slug / time.strftime("%Y%m%d-%H%M%S")
-            n = 1
-            while dest.exists():
-                n += 1
-                dest = dest.with_name(f"{dest.name.split('_')[0]}_{n}")
-            dest.mkdir(parents=True)
-            # Stream it as a tar and unpack only plain files and folders. A symlink
-            # (to a host path, say), device or fifo is never created on this
-            # computer, and no entry may land outside `dest`. Letting `docker cp`
-            # unpack it instead would recreate links, and on Windows it fails
-            # outright on the first one.
-            argv = [self.docker_bin, "cp", f"{self.container}:{src}", "-"]
+            # One export at a time in this process (sandboxes share the export
+            # folder), so two can't both pass the total cap and then both write.
+            with _EXPORT_LOCK:
+                return self._export_into(src, size_kb, Path(dest_root))
+
+    def _export_into(self, src: str, size_kb: int, dest_root: Path) -> Path:
+        # A cap on everything exported, so repeated exports can't fill the disk.
+        # Only Rewind's own export folders count: REWIND_EXPORT_DIR may be a
+        # shared folder such as Downloads.
+        used_kb = sum(_tree_bytes(f) for f in export_folders(dest_root)) // 1024
+        if self.export_total_mb and used_kb + size_kb > self.export_total_mb * 1024:
+            raise RewindError(
+                f"Exports already use {used_kb // 1024} MB of the {self.export_total_mb} MB allowed "
+                f"(REWIND_EXPORT_TOTAL_MB) in {dest_root}. Delete old exports there first."
+            )
+        slug = _SLUG.sub("-", self.task_id.lower()).strip("-")[-40:] or "task"
+        session_dir = _session_export_dir(Path(dest_root), slug)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        dest, n = session_dir / stamp, 1
+        while True:
             try:
-                with self._tar_reader(argv) as stream:
-                    self.last_export_reasons = {}
-                    self.last_export_removed = _extract_plain(stream, dest, self.export_max_mb,
-                                                              self.export_max_files,
-                                                              self.last_export_reasons)
-            except (tarfile.TarError, OSError) as exc:
-                raise RewindError(f"Couldn't copy {src} out of the sandbox: {exc}") from exc
-            name = posixpath.basename(src.rstrip("/")) or "root"
-            return dest / name
+                dest.mkdir()  # atomic: a concurrent export takes the next name
+                break
+            except FileExistsError:
+                n += 1
+                dest = session_dir / f"{stamp}_{n}"
+        # Stream it as a tar and unpack only plain files and folders. A symlink
+        # (to a host path, say), device or fifo is never created on this
+        # computer, and no entry may land outside `dest`. Letting `docker cp`
+        # unpack it instead would recreate links, and on Windows it fails
+        # outright on the first one.
+        argv = [self.docker_bin, "cp", f"{self.container}:{src}", "-"]
+        try:
+            with self._tar_reader(argv) as stream:
+                self.last_export_reasons = {}
+                self.last_export_removed = _extract_plain(stream, dest, self.export_max_mb,
+                                                          self.export_max_files,
+                                                          self.last_export_reasons)
+        except (tarfile.TarError, OSError) as exc:
+            raise RewindError(f"Couldn't copy {src} out of the sandbox: {exc}") from exc
+        name = posixpath.basename(src.rstrip("/")) or "root"
+        return dest / name
 
     # ------------------------------------------------------------- disk usage
     def snapshot_size(self, snap: Snapshot) -> Optional[int]:
@@ -1154,6 +1296,52 @@ def _merge_diff(changes: Dict[str, str], diff: str) -> None:
             changes[path] = "C"  # deleted, then recreated
         else:
             changes[path] = kind
+
+
+EXPORT_MARKER = ".hermes-rewind-export"
+
+
+def _session_export_dir(root: Path, slug: str) -> Path:
+    """The per-session export folder: ``<root>/<slug>`` if Rewind made it (it holds
+    the marker) or makes it now, else ``<slug>-rewind``, ``<slug>-rewind-2``... A
+    folder that already existed without the marker is the user's own (a
+    `default` folder in Downloads, say) and is never marked, so purge and the size
+    cap never touch it."""
+    root.mkdir(parents=True, exist_ok=True)
+    for n in range(1, 100):
+        name = slug if n == 1 else (f"{slug}-rewind" if n == 2 else f"{slug}-rewind-{n - 1}")
+        folder = root / name
+        try:
+            folder.mkdir()
+        except FileExistsError:
+            if not folder.is_symlink() and folder.is_dir() and (folder / EXPORT_MARKER).is_file():
+                return folder  # Rewind's own, from an earlier export
+            continue
+        (folder / EXPORT_MARKER).write_text(
+            "Created by Hermes Rewind exports. `hermes rewind purge --exports` deletes this folder.\n",
+            encoding="utf-8")
+        return folder
+    raise RewindError(f"Couldn't find a free folder name for exports under {root}.")
+
+
+def export_folders(root: Path, legacy: bool = False) -> List[Path]:
+    """Rewind's per-session folders directly under ``root``: those holding the
+    marker, plus (with ``legacy``) unmarked ones from before the marker existed,
+    for when ``root`` is Rewind's own default export folder."""
+    try:
+        children = list(Path(root).iterdir())
+    except OSError:
+        return []
+    found = []
+    for child in children:
+        try:
+            if child.is_symlink() or not child.is_dir():
+                continue
+            if legacy or (child / EXPORT_MARKER).is_file():
+                found.append(child)
+        except OSError:
+            continue
+    return sorted(found)
 
 
 def _tree_bytes(root: Path) -> int:
@@ -1218,6 +1406,15 @@ def _make_dirs(path: Path, root: Path) -> None:
         _owner_only(path, executable=True)  # a folder entry for one already made
 
 
+_WINDOWS = os.name == "nt"  # tests flip this to check the Windows rules anywhere
+
+
+def _bad_windows_name(part: str) -> bool:
+    """A path component Windows would reinterpret: a ":" names an NTFS stream
+    (or a drive), and trailing dots or spaces are silently stripped."""
+    return ":" in part or part != part.rstrip(". ")
+
+
 def _mark_downloaded(path: Path) -> None:
     """On Windows, add the "downloaded from the internet" mark (Mark of the Web),
     so SmartScreen and Office Protected View treat the file as coming from the
@@ -1264,6 +1461,11 @@ def _extract_plain(stream, dest: Path, max_mb: int = 0, max_files: int = 0,
             shown = "/".join(parts)
             if raw.startswith("/") or ".." in parts or ":" in parts[0]:  # absolute, climbing, or C:...
                 skip(shown, "outside")
+                continue
+            if _WINDOWS and any(_bad_windows_name(p) for p in parts):
+                # "a.exe::$DATA" would write a.exe with no Mark of the Web, and
+                # "a.txt:Zone.Identifier" would forge the mark itself.
+                skip(shown, "name")
                 continue
             target = root.joinpath(*parts)
             resolved = target.resolve()

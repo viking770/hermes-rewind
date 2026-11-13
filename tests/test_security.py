@@ -16,7 +16,7 @@ from rewind.docker_api import ApiRunner, _bytes
 from rewind.redact import MASK, redact
 from rewind.store import Store
 from rewind.environment import (
-    GUARD_IMAGE, RewindEnvironment, RewindError, _BLOCKED_V4, _guard_script,
+    EXPORT_MARKER, GUARD_IMAGE, RewindEnvironment, RewindError, _BLOCKED_V4, _guard_script,
 )
 
 from .test_environment import FakeDocker
@@ -104,17 +104,43 @@ class NetworkGuardTests(unittest.TestCase):
         registry.clear()
         self.fake = FakeDocker()
 
-    def test_internet_mode_installs_the_guard_before_any_command(self):
-        env_for(self.fake).execute("ls")
-        verbs = [(c[1], c[2] if len(c) > 2 else "") for c in self.fake.calls]
-        guard = next(i for i, c in enumerate(self.fake.calls) if c[1] == "run" and GUARD_IMAGE in c)
-        first_command = next(i for i, c in enumerate(self.fake.calls) if c[1] == "exec" and "cd " in c[-1])
-        self.assertLess(guard, first_command, verbs)
-        helper = self.fake.calls[guard]
-        sandbox = sandbox_run(self.fake)
-        self.assertIn("container:" + sandbox[sandbox.index("--name") + 1], helper)
+    def guard_runs(self, fake=None):
+        """The `docker run --rm` helpers that installed rules (not the holders)."""
+        return [c for c in (fake or self.fake).calls if c[1] == "run" and GUARD_IMAGE in c and "--rm" in c]
+
+    def test_internet_mode_installs_the_guard_before_the_sandbox_exists(self):
+        env = env_for(self.fake)
+        env.execute("ls")
+        calls = self.fake.calls
+        holder_name = env.netns_container
+        holder = next(i for i, c in enumerate(calls) if c[1] == "run" and "-d" in c and holder_name in c)
+        guard = next(i for i, c in enumerate(calls) if c in self.guard_runs())
+        sandbox = next(i for i, c in enumerate(calls) if c[1] == "run" and "-d" in c and env.container in c
+                       and c[c.index("--name") + 1] == env.container)
+        # Holder (trusted image) -> rules -> only then the sandbox, already inside the filtered namespace.
+        self.assertLess(holder, guard)
+        self.assertLess(guard, sandbox)
+        self.assertIn(GUARD_IMAGE, calls[holder])
+        self.assertEqual(calls[holder][calls[holder].index("--cap-drop") + 1], "ALL")
+        self.assertNotIn("--cap-add", calls[holder])
+        helper = calls[guard]
+        self.assertIn("container:" + holder_name, helper)
         self.assertEqual(helper[helper.index("--cap-add") + 1], "NET_ADMIN")
-        self.assertNotIn("--network", sandbox_run(self.fake))  # bridge, but guarded
+        run = sandbox_run(self.fake)
+        self.assertEqual(run[run.index("--network") + 1], "container:" + holder_name)
+
+    def test_dns_and_routes_are_read_from_the_trusted_holder_not_the_sandbox(self):
+        env = env_for(self.fake)
+        env.execute("ls")
+        reads = [c for c in self.fake.calls if c[1] == "exec" and c[-1] in ("/etc/resolv.conf", "/proc/net/route")]
+        self.assertEqual(len(reads), 2)
+        self.assertTrue(all(c[2] == env.netns_container for c in reads))
+
+    def test_holder_is_removed_with_the_sandbox(self):
+        env = env_for(self.fake)
+        env.execute("ls")
+        env.cleanup()
+        self.assertIn(["docker", "rm", "-f", env.netns_container], self.fake.calls)
 
     def test_guard_failure_falls_back_to_no_network(self):
         self.fake.guard_fails = True
@@ -134,7 +160,14 @@ class NetworkGuardTests(unittest.TestCase):
         env = env_for(self.fake)
         env.execute("rm a")
         env.restore("last")
-        self.assertEqual(len([c for c in self.fake.calls if GUARD_IMAGE in c and c[1] == "run"]), 2)
+        self.assertEqual(len(self.guard_runs()), 2)
+        # A fresh holder each time: the old namespace is removed first, never reused.
+        holders = [c for c in self.fake.calls if c[1] == "run" and "-d" in c and GUARD_IMAGE in c]
+        self.assertEqual(len(holders), 2)
+        restored = [i for i, c in enumerate(self.fake.calls) if c[1] == "run" and "-d" in c
+                    and c[c.index("--name") + 1] == env.container][-1]
+        self.assertTrue(any(c[1] == "run" and "--rm" in c and GUARD_IMAGE in c
+                            for c in self.fake.calls[:restored][-6:]))
 
     def test_none_and_full_modes_skip_the_guard(self):
         env_for(self.fake, network="none").execute("ls")
@@ -280,9 +313,40 @@ class ExportSafetyTests(unittest.TestCase):
         self.assertIn("only available in local chats", result["error"])
         self.assertNotIn("cp", self.fake.verbs())
 
+    def test_export_total_cap_ignores_files_rewind_did_not_export(self):
+        # REWIND_EXPORT_DIR may be a shared folder like Downloads: its other files don't count.
+        dest = Path(tempfile.mkdtemp())
+        (dest / "holiday.mov").write_bytes(b"x" * 3 * 1024 * 1024)
+        (dest / "other-app").mkdir()
+        (dest / "other-app" / "data.bin").write_bytes(b"x" * 3 * 1024 * 1024)
+        env = env_for(self.fake, network="none", export_total_mb=4)
+        env._tar_reader = fake_tar_reader([])
+        env.export("app", dest)  # would be refused if the 6 MB above counted
+        self.assertTrue((dest / "sec" / EXPORT_MARKER).is_file())
+
+    def test_purge_exports_deletes_only_rewinds_folders(self):
+        dest = Path(tempfile.mkdtemp())
+        (dest / "keep.txt").write_text("mine")
+        (dest / "other-app").mkdir()
+        env = env_for(self.fake, network="none")
+        env._tar_reader = fake_tar_reader([])
+        env.export("app", dest)
+        os.environ["REWIND_EXPORT_DIR"] = str(dest)
+        try:
+            counts = tools.run_purge(exports=True)
+        finally:
+            del os.environ["REWIND_EXPORT_DIR"]
+        self.assertEqual(counts["exports_deleted"], 1)
+        self.assertTrue(dest.is_dir())
+        self.assertEqual((dest / "keep.txt").read_text(), "mine")
+        self.assertTrue((dest / "other-app").is_dir())
+        self.assertFalse((dest / "sec").exists())
+
     def test_export_total_cap(self):
         dest = Path(tempfile.mkdtemp())
-        (dest / "old.bin").write_bytes(b"x" * 3 * 1024 * 1024)  # 3 MB already exported
+        (dest / "sec").mkdir()
+        (dest / "sec" / EXPORT_MARKER).write_text("")
+        (dest / "sec" / "old.bin").write_bytes(b"x" * 3 * 1024 * 1024)  # 3 MB already exported
         env = env_for(self.fake, network="none", export_total_mb=4)
 
         class Du(FakeDocker):

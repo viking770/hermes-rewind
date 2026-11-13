@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 
 from rewind import policy, registry, store as store_mod, tools, version
-from rewind.environment import _LIST_FILES, SLIM_IMAGE, RewindEnvironment, RewindError
+from rewind.environment import _LIST_FILES, GUARD_IMAGE, SLIM_IMAGE, RewindEnvironment, RewindError
 from rewind.store import Store
 
 from .test_environment import FakeDocker
@@ -41,7 +41,7 @@ class FilesDocker(FakeDocker):
 
     def __call__(self, argv, timeout=None):
         verb = argv[1]
-        if verb == "run" and "--rm" not in argv:
+        if verb == "run" and "--rm" not in argv and GUARD_IMAGE not in argv:  # not the network holder
             self.started_from = next(a for a in argv if a.startswith(("python:", "hermes-rewind/", "hermes-rewind-base:")))
             self.live = None
         if verb == "exec" and argv[-1] == _LIST_FILES:
@@ -121,6 +121,30 @@ class ParkingTests(unittest.TestCase):
         # New snapshots continue the numbering instead of clashing.
         again.execute("rm x")
         self.assertEqual(again.snapshots[-1].id, "s4")
+
+    def test_resumed_sandbox_record_survives_a_crash(self):
+        # The live record written after a resume must still load (container name
+        # matches the repository), or a crash then would lose all undo history.
+        env = self.parked_env()
+        env.cleanup()
+        record = self.store.load("session:demo")
+        self.fake.image_info[record["image"]] = "100 3"
+        again = make_env(self.fake, keep_hours=1, store=self.store)
+        again.execute("rm x")
+        live = self.store.load("session:demo")
+        self.assertIsNotNone(live)
+        self.assertEqual(live["status"], "live")
+        self.assertEqual(live["container"], again.container)
+        self.assertEqual(again.container, "hermes-rewind-" + again.repository.split("/", 1)[1])
+        self.assertEqual(len(live["snapshots"]), 3)
+        # And a crash right now is recovered by the next sandbox.
+        live["owner_pid"] = DEAD_PID
+        self.store.save(live)
+        registry.clear()
+        self.fake.image_info[f"{again.repository}:recovered"] = "100 3"
+        third = make_env(self.fake, keep_hours=1, store=self.store)
+        self.assertEqual(len(third.snapshots), 3)
+        self.assertEqual(third._image, f"{again.repository}:recovered")
 
     def test_resume_skipped_when_images_are_gone(self):
         self.parked_env().cleanup()
