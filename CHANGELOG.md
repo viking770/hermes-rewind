@@ -1,8 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.2.5 (2026-11-13)
 
-Fixes from a QA and security review of 0.2.4.
+Fixes from a QA and security review of 0.2.4, and a second independent review
+of those fixes (pull request #2). The catalog entry pins the commit for this
+release; `git log 45aba11..` lists every change.
 
 ### Security
 - **The sandbox never runs on an unfiltered network.** In `internet` mode a
